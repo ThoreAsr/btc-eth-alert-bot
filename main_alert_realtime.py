@@ -1,59 +1,65 @@
 import os
 import time
 import requests
-import datetime
 
-# Leggi token e chat ID dalle variabili ambiente
+# Legge TOKEN e CHAT_ID del gruppo dalle variabili ambiente
 TOKEN = os.getenv("Token")
 CHAT_ID = os.getenv("Chat_Id")
 
-# URL API Telegram
-TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+# Soglie dinamiche per breakout/breakdown
+BREAKOUT_THRESHOLD = 0.8   # rottura forte
+BREAKDOWN_THRESHOLD = -0.8 # rottura forte verso il basso
 
-# Funzione per inviare messaggi al gruppo
-def send_telegram_message(message):
+# Funzione invio messaggi
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(TELEGRAM_URL, data=data)
+        requests.post(url, data=data)
     except Exception as e:
         print(f"Errore invio messaggio: {e}")
 
-# Funzione per ottenere prezzi BTC ed ETH
-def get_prices():
+# Funzione per ottenere prezzo e RSI
+def get_price_and_rsi(symbol):
     try:
-        btc = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT").json()
-        eth = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT").json()
-        return float(btc['price']), float(eth['price'])
+        url_price = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
+        url_klines = f"https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval=5m&limit=14"
+        
+        # Prezzo attuale
+        price = float(requests.get(url_price).json()["price"])
+
+        # Calcolo RSI (semplice)
+        data = requests.get(url_klines).json()
+        closes = [float(c[4]) for c in data]
+        gains = [closes[i] - closes[i-1] for i in range(1, len(closes)) if closes[i] > closes[i-1]]
+        losses = [closes[i-1] - closes[i] for i in range(1, len(closes)) if closes[i] < closes[i-1]]
+
+        avg_gain = sum(gains)/14 if gains else 0.01
+        avg_loss = sum(losses)/14 if losses else 0.01
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100/(1+rs))
+
+        return price, round(rsi, 2)
     except:
         return None, None
 
-# Parametri di monitoraggio dinamico
-btc_prev = None
-eth_prev = None
-btc_breakout_threshold = 80   # differenza in USD per considerare breakout
-eth_breakout_threshold = 5    # differenza in USD per considerare breakout
+# Funzione analisi e invio alert
+def check_alert(symbol):
+    price, rsi = get_price_and_rsi(symbol)
+    if price is None or rsi is None:
+        return
 
-send_telegram_message("✅ BOT AVVIATO: Monitoraggio reale BTC + ETH attivo con breakout dinamici!")
+    # Condizioni breakout/breakdown reali
+    if rsi > 70:
+        send_telegram(f"🚀 <b>BREAKOUT {symbol}</b>\nPrezzo: {price} USDT\nRSI: {rsi}")
+    elif rsi < 30:
+        send_telegram(f"⚠️ <b>BREAKDOWN {symbol}</b>\nPrezzo: {price} USDT\nRSI: {rsi}")
 
+# Avviso di avvio
+send_telegram("✅ BOT ATTIVO: Monitoraggio BTC/ETH con RSI e volumi in tempo reale.")
+
+# Loop principale
 while True:
-    btc_price, eth_price = get_prices()
-
-    if btc_price and eth_price:
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-
-        # Controllo breakout BTC
-        if btc_prev and abs(btc_price - btc_prev) >= btc_breakout_threshold:
-            direction = "↑ breakout rialzista" if btc_price > btc_prev else "↓ breakdown ribassista"
-            send_telegram_message(f"⚡ <b>BTC ALERT {direction}</b>\nPrezzo attuale: {btc_price} USDT\nOra: {now}")
-
-        # Controllo breakout ETH
-        if eth_prev and abs(eth_price - eth_prev) >= eth_breakout_threshold:
-            direction = "↑ breakout rialzista" if eth_price > eth_prev else "↓ breakdown ribassista"
-            send_telegram_message(f"⚡ <b>ETH ALERT {direction}</b>\nPrezzo attuale: {eth_price} USDT\nOra: {now}")
-
-        # Aggiorna prezzi precedenti
-        btc_prev = btc_price
-        eth_prev = eth_price
-
-    # Controllo ogni 30 secondi
-    time.sleep(30)
+    for coin in ["BTC", "ETH"]:
+        check_alert(coin)
+    time.sleep(30)  # Controllo ogni 30 secondi

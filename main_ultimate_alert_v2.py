@@ -2,9 +2,12 @@ import os
 import time
 import requests
 import traceback
+from datetime import datetime
 
 CHECK_INTERVAL = 30  # secondi tra controlli
+REPORT_INTERVAL = 3600  # secondi per report orario
 
+# --- Funzioni di supporto ---
 def send_telegram_message(message):
     token = os.getenv("Token")
     chat_id = os.getenv("Chat_Id")
@@ -28,6 +31,7 @@ def get_dynamic_levels(prices):
         return None, None
     return min(prices), max(prices)
 
+# --- Monitor per singolo simbolo ---
 def monitor_symbol(symbol, prices, last_alert):
     price = get_price(symbol)
     if price:
@@ -37,7 +41,7 @@ def monitor_symbol(symbol, prices, last_alert):
 
         support, resistance = get_dynamic_levels(prices)
 
-        # Reset alert se rientra nel range
+        # Reset alert se prezzo torna nella fascia neutra
         if last_alert and support and resistance and support < price < resistance:
             last_alert = None
 
@@ -51,22 +55,38 @@ def monitor_symbol(symbol, prices, last_alert):
             send_telegram_message(f"⚠️ {symbol} BREAKDOWN: {price} (nuovo supporto {support})")
             last_alert = "down"
 
-    return last_alert
+    return last_alert, price
 
+# --- Funzione principale ---
 def start_bot():
     print("=== BOT BTC/ETH AVVIATO ===")
-    send_telegram_message("✅ Bot BTC/ETH operativo 24/7: breakout e breakdown automatici da 70.000 ai massimi!")
+    send_telegram_message("✅ Bot BTC/ETH operativo 24/7: breakout, breakdown e report automatici attivi.")
 
     btc_prices, eth_prices = [], []
     last_alert_btc, last_alert_eth = None, None
+    last_report_time = time.time()
 
     while True:
         try:
             # Monitor BTC
-            last_alert_btc = monitor_symbol("BTCUSDT", btc_prices, last_alert_btc)
+            last_alert_btc, btc_price = monitor_symbol("BTCUSDT", btc_prices, last_alert_btc)
 
             # Monitor ETH
-            last_alert_eth = monitor_symbol("ETHUSDT", eth_prices, last_alert_eth)
+            last_alert_eth, eth_price = monitor_symbol("ETHUSDT", eth_prices, last_alert_eth)
+
+            # Report orario automatico
+            if time.time() - last_report_time >= REPORT_INTERVAL:
+                btc_support, btc_resistance = get_dynamic_levels(btc_prices)
+                eth_support, eth_resistance = get_dynamic_levels(eth_prices)
+                report_msg = (
+                    f"🕒 Report {datetime.now().strftime('%H:%M')}\n\n"
+                    f"BTC: {btc_price}\n"
+                    f"Supporto: {btc_support} | Resistenza: {btc_resistance}\n\n"
+                    f"ETH: {eth_price}\n"
+                    f"Supporto: {eth_support} | Resistenza: {eth_resistance}"
+                )
+                send_telegram_message(report_msg)
+                last_report_time = time.time()
 
             time.sleep(CHECK_INTERVAL)
 

@@ -4,16 +4,14 @@ import requests
 import traceback
 import statistics
 
-# === CONFIGURAZIONE ===
 CHECK_INTERVAL = 30  # secondi tra controlli
 
-# LIVELLI FISSI PERSONALIZZATI
-BTC_FIXED_BREAKOUT = 118300.0
-BTC_FIXED_BREAKDOWN = 117500.0
-ETH_FIXED_BREAKOUT = 3000.0
-ETH_FIXED_BREAKDOWN = 2950.0
+# --- Livelli fissi da variabili d'ambiente (modificabili da Render) ---
+BTC_FIXED_BREAKOUT = float(os.getenv("BTC_BREAKOUT", 118300))
+BTC_FIXED_BREAKDOWN = float(os.getenv("BTC_BREAKDOWN", 117500))
+ETH_FIXED_BREAKOUT = float(os.getenv("ETH_BREAKOUT", 3000))
+ETH_FIXED_BREAKDOWN = float(os.getenv("ETH_BREAKDOWN", 2950))
 
-# === FUNZIONI TELEGRAM ===
 def send_telegram_message(message):
     token = os.getenv("Token")
     chat_id = os.getenv("Chat_Id")
@@ -24,7 +22,6 @@ def send_telegram_message(message):
     except Exception as e:
         print("Errore invio Telegram:", e)
 
-# === FUNZIONI PREZZO ===
 def get_price(symbol="BTCUSDT"):
     url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
     try:
@@ -34,45 +31,42 @@ def get_price(symbol="BTCUSDT"):
         return None
 
 def get_dynamic_levels(prices):
-    if len(prices) < 5:
+    if len(prices) < 3:  # bastano 3 letture per iniziare
         return None, None
-    support = min(prices)
-    resistance = max(prices)
-    return support, resistance
+    return min(prices), max(prices)
 
-# === LOGICA BOT ===
 def start_bot():
     print("=== BOT BTC/ETH AVVIATO ===")
-    send_telegram_message("✅ Bot BTC/ETH operativo 24/7 su Render: alert dinamici + fissi attivati.")
+    send_telegram_message("✅ Bot BTC/ETH operativo 24/7: alert dinamici + fissi attivati.")
 
-    btc_prices = []
-    eth_prices = []
-    last_alert_btc = None
-    last_alert_eth = None
+    btc_prices, eth_prices = [], []
+    last_alert_btc, last_alert_eth = None, None
 
     while True:
         try:
-            # OTTIENI PREZZI
             btc_price = get_price("BTCUSDT")
             eth_price = get_price("ETHUSDT")
 
-            # ---------------- BTC ----------------
+            # ----------- BTC -----------
             if btc_price:
                 btc_prices.append(btc_price)
                 if len(btc_prices) > 20:
                     btc_prices.pop(0)
-
                 support_btc, resistance_btc = get_dynamic_levels(btc_prices)
 
-                # Livelli dinamici
+                # Reset se prezzo torna neutro
+                if last_alert_btc and support_btc and resistance_btc and support_btc < btc_price < resistance_btc:
+                    last_alert_btc = None
+
+                # Breakout/Breakdown dinamici
                 if resistance_btc and btc_price >= resistance_btc and last_alert_btc != "up":
-                    send_telegram_message(f"🚀 BTC BREAKOUT DINAMICO: {btc_price} (resistenza {resistance_btc})")
+                    send_telegram_message(f"🚀 BTC BREAKOUT DINAMICO: {btc_price} (res {resistance_btc})")
                     last_alert_btc = "up"
                 elif support_btc and btc_price <= support_btc and last_alert_btc != "down":
-                    send_telegram_message(f"⚠️ BTC BREAKDOWN DINAMICO: {btc_price} (supporto {support_btc})")
+                    send_telegram_message(f"⚠️ BTC BREAKDOWN DINAMICO: {btc_price} (sup {support_btc})")
                     last_alert_btc = "down"
 
-                # Livelli fissi
+                # Breakout/Breakdown fissi
                 if btc_price >= BTC_FIXED_BREAKOUT and last_alert_btc != "fixed_up":
                     send_telegram_message(f"🚀 BTC BREAKOUT FISSO: {btc_price} sopra {BTC_FIXED_BREAKOUT}")
                     last_alert_btc = "fixed_up"
@@ -80,23 +74,23 @@ def start_bot():
                     send_telegram_message(f"⚠️ BTC BREAKDOWN FISSO: {btc_price} sotto {BTC_FIXED_BREAKDOWN}")
                     last_alert_btc = "fixed_down"
 
-            # ---------------- ETH ----------------
+            # ----------- ETH -----------
             if eth_price:
                 eth_prices.append(eth_price)
                 if len(eth_prices) > 20:
                     eth_prices.pop(0)
-
                 support_eth, resistance_eth = get_dynamic_levels(eth_prices)
 
-                # Livelli dinamici
+                if last_alert_eth and support_eth and resistance_eth and support_eth < eth_price < resistance_eth:
+                    last_alert_eth = None
+
                 if resistance_eth and eth_price >= resistance_eth and last_alert_eth != "up":
-                    send_telegram_message(f"🚀 ETH BREAKOUT DINAMICO: {eth_price} (resistenza {resistance_eth})")
+                    send_telegram_message(f"🚀 ETH BREAKOUT DINAMICO: {eth_price} (res {resistance_eth})")
                     last_alert_eth = "up"
                 elif support_eth and eth_price <= support_eth and last_alert_eth != "down":
-                    send_telegram_message(f"⚠️ ETH BREAKDOWN DINAMICO: {eth_price} (supporto {support_eth})")
+                    send_telegram_message(f"⚠️ ETH BREAKDOWN DINAMICO: {eth_price} (sup {support_eth})")
                     last_alert_eth = "down"
 
-                # Livelli fissi
                 if eth_price >= ETH_FIXED_BREAKOUT and last_alert_eth != "fixed_up":
                     send_telegram_message(f"🚀 ETH BREAKOUT FISSO: {eth_price} sopra {ETH_FIXED_BREAKOUT}")
                     last_alert_eth = "fixed_up"
@@ -112,7 +106,6 @@ def start_bot():
             time.sleep(5)
 
 if __name__ == "__main__":
-    # Loop infinito che riavvia in caso di crash
     while True:
         try:
             start_bot()

@@ -1,70 +1,74 @@
-import os
 import time
 import requests
-import statistics
 
-# ===== CONFIGURAZIONE =====
-TOKEN = os.getenv("Token")         # Token del bot Telegram da Render
-CHAT_ID = os.getenv("Chat_Id")     # Chat ID personale da Render
-CHECK_INTERVAL = 300               # Controllo ogni 5 minuti (300 secondi)
-RSI_PERIOD = 14                    # Periodo RSI
-ALERT_THRESHOLD = 70               # Soglia RSI per alert
-PRICE_API = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=100"
+# --- CONFIGURAZIONE ---
+TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"  # Bot token Telegram
+CHAT_ID = "356760541"  # Tuo ID Telegram
 
+# Livelli breakout/breakdown iniziali
+LEVELS = {
+    "BTC": {"breakout": [117700, 118300], "breakdown": [116800, 116300]},
+    "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
+}
 
-# ===== FUNZIONE INVIO TELEGRAM =====
-def send_telegram_message(message):
+# URL API prezzi (Binance)
+PRICE_URLS = {
+    "BTC": "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+    "ETH": "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+}
+
+# --- FUNZIONI ---
+def send_telegram_message(message: str):
+    """Invia un messaggio su Telegram"""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": message}
+    payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=data)
+        requests.post(url, data=payload, timeout=5)
     except Exception as e:
-        print(f"Errore invio messaggio: {e}")
+        print(f"Errore invio Telegram: {e}")
 
+def get_price(symbol: str) -> float:
+    """Ottiene prezzo corrente da Binance"""
+    try:
+        resp = requests.get(PRICE_URLS[symbol], timeout=5)
+        return float(resp.json()["price"])
+    except Exception as e:
+        print(f"Errore ottenimento prezzo {symbol}: {e}")
+        return None
 
-# ===== CALCOLO RSI =====
-def calculate_rsi(prices, period=14):
-    gains, losses = [], []
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i-1]
-        if change > 0:
-            gains.append(change)
-        else:
-            losses.append(abs(change))
+def check_levels(symbol: str, price: float, levels: dict, dynamic_high: dict, dynamic_low: dict):
+    """Controlla breakout/breakdown e dinamici"""
+    # Breakout fissi
+    for level in levels["breakout"]:
+        if price >= level:
+            send_telegram_message(f"🚀 BREAKOUT {symbol}: superato {level} – prezzo attuale {price}")
 
-    avg_gain = statistics.mean(gains[-period:]) if gains else 0
-    avg_loss = statistics.mean(losses[-period:]) if losses else 1
+    # Breakdown fissi
+    for level in levels["breakdown"]:
+        if price <= level:
+            send_telegram_message(f"⚠️ BREAKDOWN {symbol}: sotto {level} – prezzo attuale {price}")
 
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
+    # Nuovi massimi/minimi dinamici
+    if price > dynamic_high[symbol]:
+        dynamic_high[symbol] = price
+        send_telegram_message(f"📈 NUOVO MASSIMO {symbol}: {price}")
+    if price < dynamic_low[symbol]:
+        dynamic_low[symbol] = price
+        send_telegram_message(f"📉 NUOVO MINIMO {symbol}: {price}")
 
-
-# ===== LOOP PRINCIPALE =====
-def main():
-    send_telegram_message("✅ BOT AVVIATO: Alert BTC/ETH attivi con RSI e volumi.")
-
-    while True:
-        try:
-            # Dati prezzo BTC da Binance
-            response = requests.get(PRICE_API)
-            data = response.json()
-
-            close_prices = [float(candle[4]) for candle in data]
-            rsi = calculate_rsi(close_prices, RSI_PERIOD)
-
-            # Alert su RSI
-            if rsi >= ALERT_THRESHOLD:
-                send_telegram_message(f"🚨 ALERT BTC: RSI alto = {rsi}")
-
-            # Puoi aggiungere qui anche ETH con stessa logica
-            # e controlli sui volumi se vuoi renderlo ancora più preciso
-
-        except Exception as e:
-            print(f"Errore loop principale: {e}")
-
-        time.sleep(CHECK_INTERVAL)
-
-
+# --- MAIN LOOP ---
 if __name__ == "__main__":
-    main()
+    # Messaggio di avvio
+    send_telegram_message("✅ BOT ATTIVO – Monitoraggio BTC & ETH avviato con breakout dinamici")
+
+    # Inizializza massimi/minimi dinamici
+    dynamic_high = {"BTC": 0, "ETH": 0}
+    dynamic_low = {"BTC": 999999, "ETH": 999999}
+
+    # Loop di monitoraggio
+    while True:
+        for symbol in ["BTC", "ETH"]:
+            price = get_price(symbol)
+            if price:
+                check_levels(symbol, price, LEVELS[symbol], dynamic_high, dynamic_low)
+        time.sleep(30)  # Controllo ogni 30 secondi

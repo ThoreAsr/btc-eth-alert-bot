@@ -11,19 +11,13 @@ LEVELS = {
     "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
 }
 
-# Soglie volumi realistiche
-VOLUME_THRESHOLDS = {"BTC": 100000000, "ETH": 50000000}
+# Soglie volume realistiche (15m)
+VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}
 
-PRICE_URLS = {
-    "BTC": "https://api.mexc.com/api/v3/ticker/price?symbol=BTCUSDT",
-    "ETH": "https://api.mexc.com/api/v3/ticker/price?symbol=ETHUSDT"
-}
-VOLUME_URLS = {
-    "BTC": "https://api.mexc.com/api/v3/ticker/24hr?symbol=BTCUSDT",
-    "ETH": "https://api.mexc.com/api/v3/ticker/24hr?symbol=ETHUSDT"
-}
+# Endpoint MEXC per candela 15m
+KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
 
-# Stato segnali per evitare spam
+# Stato segnali per anti-spam
 last_signal = {"BTC": None, "ETH": None}
 
 # --- FUNZIONI ---
@@ -35,79 +29,80 @@ def send_telegram_message(message: str):
     except Exception as e:
         print(f"Errore invio Telegram: {e}")
 
-def get_price(symbol: str) -> float:
+def get_klines(symbol: str):
+    """Ottiene ultime 60 candele 15m da MEXC"""
     headers = {"User-Agent": "Mozilla/5.0"}
-    url = PRICE_URLS[symbol]
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, headers=headers, timeout=5)
-            data = resp.json()
-            if "price" in data:
-                return float(data["price"])
-        except:
-            pass
-        time.sleep(1)
-    send_telegram_message(f"⚠️ Errore prezzo {symbol}")
-    return None
-
-def get_volume(symbol: str) -> float:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    url = VOLUME_URLS[symbol]
+    url = KLINE_URL.format(symbol=symbol)
     try:
         resp = requests.get(url, headers=headers, timeout=5)
-        data = resp.json()
-        if "quoteVolume" in data:
-            return float(data["quoteVolume"])
-    except:
-        pass
-    return 0
+        return resp.json()
+    except Exception as e:
+        print(f"Errore klines {symbol}: {e}")
+        return None
 
-def calc_support_resistance(prices: list):
-    if not prices:
-        return None, None
-    return min(prices), max(prices)
+def calc_ema(prices, period):
+    """Calcola EMA semplice"""
+    k = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
-def check_levels(symbol, price, volume, levels, dynamic_high, dynamic_low):
+def analyze(symbol):
+    """Analizza dati per generare segnali"""
+    data = get_klines(symbol)
+    if not data:
+        send_telegram_message(f"⚠️ Errore dati {symbol}")
+        return None
+
+    # Prezzi chiusura e volumi delle ultime 60 candele
+    closes = [float(c[4]) for c in data]  # prezzo close
+    volumes = [float(c[5]) for c in data]  # volume base
+
+    last_close = closes[-1]
+    last_volume = volumes[-1]
+
+    # Calcolo EMA
+    ema20 = calc_ema(closes[-20:], 20)
+    ema60 = calc_ema(closes[-60:], 60)
+
+    return {
+        "price": last_close,
+        "volume": last_volume,
+        "ema20": ema20,
+        "ema60": ema60
+    }
+
+def check_signal(symbol, analysis, levels):
     global last_signal
+    price = analysis["price"]
+    volume = analysis["volume"]
+    ema20 = analysis["ema20"]
+    ema60 = analysis["ema60"]
+
     vol_thresh = VOLUME_THRESHOLDS[symbol]
 
-    # Breakout
+    # Breakout LONG
     for level in levels["breakout"]:
-        if price >= level:
-            if volume > vol_thresh and last_signal[symbol] != "LONG":
-                send_telegram_message(f"🟢 LONG {symbol} | {price}$ | Vol {round(volume/1e6,1)}M")
+        if price >= level and ema20 > ema60 and volume > vol_thresh:
+            if last_signal[symbol] != "LONG":
+                send_telegram_message(f"🟢 LONG {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
                 last_signal[symbol] = "LONG"
-            elif volume <= vol_thresh:
-                send_telegram_message(f"⚠️ Breakout debole {symbol}: {price}$ (Vol {round(volume/1e6,1)}M)")
 
-    # Breakdown
+    # Breakdown SHORT
     for level in levels["breakdown"]:
-        if price <= level:
-            if volume > vol_thresh and last_signal[symbol] != "SHORT":
-                send_telegram_message(f"🔴 SHORT {symbol} | {price}$ | Vol {round(volume/1e6,1)}M")
+        if price <= level and ema20 < ema60 and volume > vol_thresh:
+            if last_signal[symbol] != "SHORT":
+                send_telegram_message(f"🔴 SHORT {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
                 last_signal[symbol] = "SHORT"
-            elif volume <= vol_thresh:
-                send_telegram_message(f"⚠️ Breakdown debole {symbol}: {price}$ (Vol {round(volume/1e6,1)}M)")
 
-    # Reset segnali se torna neutro
+    # Reset segnale se neutro
     if levels["breakdown"][-1] < price < levels["breakout"][0]:
         last_signal[symbol] = None
 
-    # Dinamici
-    if price > dynamic_high[symbol]:
-        dynamic_high[symbol] = price
-        send_telegram_message(f"📈 Nuovo massimo {symbol}: {price}$")
-    if price < dynamic_low[symbol]:
-        dynamic_low[symbol] = price
-        send_telegram_message(f"📉 Nuovo minimo {symbol}: {price}$")
-
 # --- MAIN ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot attivo 24/7 – BTC & ETH breakout + volumi + segnali ottimizzati Apple Watch")
-
-    dynamic_high = {"BTC": 0, "ETH": 0}
-    dynamic_low = {"BTC": 999999, "ETH": 999999}
-    price_history = {"BTC": [], "ETH": []}
+    send_telegram_message("✅ Bot PRO attivo 24/7 – Breakout con EMA & volumi confermati (Apple Watch ready)")
 
     while True:
         now = datetime.utcnow() + timedelta(hours=2)
@@ -116,20 +111,18 @@ if __name__ == "__main__":
         report_msg = f"🕒 Report {timestamp}\n"
 
         for symbol in ["BTC", "ETH"]:
-            price = get_price(symbol)
-            volume = get_volume(symbol)
+            analysis = analyze(symbol)
+            if analysis:
+                price = analysis["price"]
+                volume = analysis["volume"]
+                ema20 = analysis["ema20"]
+                ema60 = analysis["ema60"]
 
-            if price:
-                price_history[symbol].append(price)
-                if len(price_history[symbol]) > 50:
-                    price_history[symbol].pop(0)
+                check_signal(symbol, analysis, LEVELS[symbol])
 
-                support, resistance = calc_support_resistance(price_history[symbol])
-                check_levels(symbol, price, volume, LEVELS[symbol], dynamic_high, dynamic_low)
-
-                report_msg += f"\n{symbol}: {price}$ | Sup: {support} | Res: {resistance} | Vol: {round(volume/1e6,1)}M"
+                report_msg += f"\n{symbol}: {round(price,2)}$ | EMA20: {round(ema20,2)} | EMA60: {round(ema60,2)} | Vol: {round(volume/1e6,1)}M"
             else:
-                report_msg += f"\n{symbol}: Errore prezzo"
+                report_msg += f"\n{symbol}: Errore dati"
 
         send_telegram_message(report_msg)
         time.sleep(1800)

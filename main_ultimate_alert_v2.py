@@ -14,12 +14,16 @@ LEVELS = {
 # Soglie volume realistiche (USDT)
 VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}
 
+# API candele 15m MEXC
 KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
 
+# Stato segnali per evitare spam
 last_signal = {"BTC": None, "ETH": None}
+
 
 # --- FUNZIONI ---
 def send_telegram_message(message: str):
+    """Invia messaggio su Telegram"""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
     try:
@@ -27,7 +31,9 @@ def send_telegram_message(message: str):
     except Exception as e:
         print(f"Errore invio Telegram: {e}")
 
+
 def get_klines(symbol: str):
+    """Ottiene ultime 60 candele 15m da MEXC"""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = KLINE_URL.format(symbol=symbol)
     try:
@@ -37,28 +43,31 @@ def get_klines(symbol: str):
         print(f"Errore klines {symbol}: {e}")
         return None
 
+
 def calc_ema(prices, period):
+    """Calcola EMA (Exponential Moving Average)"""
     k = 2 / (period + 1)
     ema = prices[0]
     for price in prices[1:]:
         ema = price * k + ema * (1 - k)
     return ema
 
+
 def analyze(symbol):
-    """Analizza ultime 60 candele 15m e calcola dati"""
+    """Analizza dati candele per segnali"""
     data = get_klines(symbol)
     if not data:
         send_telegram_message(f"⚠️ Errore dati {symbol}")
         return None
 
-    closes = [float(c[4]) for c in data]  # prezzo chiusura
-    base_volumes = [float(c[5]) for c in data]  # volume in BTC o ETH
+    closes = [float(c[4]) for c in data]  # Prezzi di chiusura
+    base_volumes = [float(c[5]) for c in data]  # Volumi in asset
 
-    # Calcola volume in USDT per ogni candela
+    # Volume in USDT = base_volume * prezzo_chiusura
     usdt_volumes = [closes[i] * base_volumes[i] for i in range(len(closes))]
 
     last_close = closes[-1]
-    last_volume = usdt_volumes[-1]  # Volume 15m in USDT
+    last_volume = usdt_volumes[-1]  # Volume della candela 15m in USDT
 
     ema20 = calc_ema(closes[-20:], 20)
     ema60 = calc_ema(closes[-60:], 60)
@@ -70,7 +79,9 @@ def analyze(symbol):
         "ema60": ema60
     }
 
+
 def check_signal(symbol, analysis, levels):
+    """Controlla breakout/breakdown e invia segnali"""
     global last_signal
     price = analysis["price"]
     volume = analysis["volume"]
@@ -97,9 +108,16 @@ def check_signal(symbol, analysis, levels):
     if levels["breakdown"][-1] < price < levels["breakout"][0]:
         last_signal[symbol] = None
 
+
+def format_report_line(symbol, price, ema20, ema60, volume):
+    """Crea riga report con colore direzione trend"""
+    trend = "🟢" if ema20 > ema60 else "🔴" if ema20 < ema60 else "⚪"
+    return f"{trend} {symbol}: {round(price,2)}$ | EMA20:{round(ema20,2)} | EMA60:{round(ema60,2)} | Vol:{round(volume/1e6,1)}M"
+
+
 # --- MAIN ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot PRO attivo – Breakout confermati con EMA + Volumi 15m (Apple Watch ready)")
+    send_telegram_message("✅ Bot PRO attivo – Breakout con EMA + Volumi 15m confermati (Apple Watch ready)")
 
     while True:
         now = datetime.utcnow() + timedelta(hours=2)
@@ -117,9 +135,9 @@ if __name__ == "__main__":
 
                 check_signal(symbol, analysis, LEVELS[symbol])
 
-                report_msg += f"\n{symbol}: {round(price,2)}$ | EMA20: {round(ema20,2)} | EMA60: {round(ema60,2)} | Vol: {round(volume/1e6,1)}M"
+                report_msg += f"\n{format_report_line(symbol, price, ema20, ema60, volume)}"
             else:
                 report_msg += f"\n{symbol}: Errore dati"
 
         send_telegram_message(report_msg)
-        time.sleep(1800)
+        time.sleep(1800)  # Report ogni 30 min

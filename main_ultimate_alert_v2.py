@@ -14,7 +14,6 @@ LEVELS = {
 # Soglie volume realistiche (USDT)
 VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}
 
-# API candele 15m MEXC
 KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
 
 # Stato segnali per evitare spam
@@ -92,17 +91,21 @@ def check_signal(symbol, analysis, levels):
 
     # Breakout LONG
     for level in levels["breakout"]:
-        if price >= level and ema20 > ema60 and volume > vol_thresh:
-            if last_signal[symbol] != "LONG":
+        if price >= level and ema20 > ema60:
+            if volume > vol_thresh and last_signal[symbol] != "LONG":
                 send_telegram_message(f"🟢 LONG {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
                 last_signal[symbol] = "LONG"
+            elif volume <= vol_thresh:
+                send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
 
     # Breakdown SHORT
     for level in levels["breakdown"]:
-        if price <= level and ema20 < ema60 and volume > vol_thresh:
-            if last_signal[symbol] != "SHORT":
+        if price <= level and ema20 < ema60:
+            if volume > vol_thresh and last_signal[symbol] != "SHORT":
                 send_telegram_message(f"🔴 SHORT {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
                 last_signal[symbol] = "SHORT"
+            elif volume <= vol_thresh:
+                send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
 
     # Reset segnale se neutro
     if levels["breakdown"][-1] < price < levels["breakout"][0]:
@@ -117,7 +120,7 @@ def format_report_line(symbol, price, ema20, ema60, volume):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot PRO attivo – Breakout con EMA + Volumi 15m confermati (Apple Watch ready)")
+    send_telegram_message("✅ Bot PRO attivo – Breakout confermati con EMA + Volumi 15m (Apple Watch ready)")
 
     while True:
         now = datetime.utcnow() + timedelta(hours=2)

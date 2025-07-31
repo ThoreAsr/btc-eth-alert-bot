@@ -29,13 +29,24 @@ def send_telegram_message(message: str):
         print(f"Errore invio Telegram: {e}")
 
 def get_price(symbol: str) -> float:
-    """Ottiene prezzo corrente da Binance"""
-    try:
-        resp = requests.get(PRICE_URLS[symbol], timeout=5)
-        return float(resp.json()["price"])
-    except Exception as e:
-        print(f"Errore ottenimento prezzo {symbol}: {e}")
-        return None
+    """Ottiene prezzo corrente da Binance con retry e header"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = PRICE_URLS[symbol]
+
+    for attempt in range(3):  # Prova 3 volte
+        try:
+            resp = requests.get(url, headers=headers, timeout=5)
+            data = resp.json()
+            if "price" in data:
+                return float(data["price"])
+        except Exception as e:
+            print(f"Tentativo {attempt+1} fallito per {symbol}: {e}")
+        time.sleep(1)  # Aspetta 1s tra i tentativi
+
+    # Se fallisce dopo 3 tentativi
+    send_telegram_message(f"⚠️ Errore nel recupero prezzo per {symbol} dopo 3 tentativi")
+    return None
+
 
 def calc_support_resistance(prices: list):
     """Calcola supporto e resistenza base su ultimi prezzi"""

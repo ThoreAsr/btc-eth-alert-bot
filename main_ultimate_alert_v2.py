@@ -12,10 +12,10 @@ LEVELS = {
     "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
 }
 
-# API Binance per prezzi
+# API MEXC per prezzi
 PRICE_URLS = {
-    "BTC": "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-    "ETH": "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+    "BTC": "https://api.mexc.com/api/v3/ticker/price?symbol=BTCUSDT",
+    "ETH": "https://api.mexc.com/api/v3/ticker/price?symbol=ETHUSDT"
 }
 
 # --- FUNZIONI ---
@@ -29,11 +29,11 @@ def send_telegram_message(message: str):
         print(f"Errore invio Telegram: {e}")
 
 def get_price(symbol: str) -> float:
-    """Ottiene prezzo corrente da Binance con retry e header"""
+    """Ottiene prezzo corrente da MEXC con retry"""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = PRICE_URLS[symbol]
 
-    for attempt in range(3):  # Prova 3 volte
+    for attempt in range(3):
         try:
             resp = requests.get(url, headers=headers, timeout=5)
             data = resp.json()
@@ -41,12 +41,10 @@ def get_price(symbol: str) -> float:
                 return float(data["price"])
         except Exception as e:
             print(f"Tentativo {attempt+1} fallito per {symbol}: {e}")
-        time.sleep(1)  # Aspetta 1s tra i tentativi
+        time.sleep(1)
 
-    # Se fallisce dopo 3 tentativi
     send_telegram_message(f"⚠️ Errore nel recupero prezzo per {symbol} dopo 3 tentativi")
     return None
-
 
 def calc_support_resistance(prices: list):
     """Calcola supporto e resistenza base su ultimi prezzi"""
@@ -80,17 +78,14 @@ def check_levels(symbol: str, price: float, levels: dict, dynamic_high: dict, dy
 
 # --- MAIN ---
 if __name__ == "__main__":
-    send_telegram_message("✅ BOT ATTIVO 24/7 – Monitoraggio BTC & ETH con breakout dinamici + fissi attivati.")
+    send_telegram_message("✅ BOT ATTIVO 24/7 – Monitoraggio BTC & ETH (MEXC) con breakout dinamici + fissi attivati.")
 
-    # Massimi/minimi dinamici iniziali
     dynamic_high = {"BTC": 0, "ETH": 0}
     dynamic_low = {"BTC": 999999, "ETH": 999999}
-
-    # Lista prezzi per supporto/resistenza
     price_history = {"BTC": [], "ETH": []}
 
     while True:
-        now = datetime.utcnow() + timedelta(hours=2)  # Ora italiana (UTC+2)
+        now = datetime.utcnow() + timedelta(hours=2)  # Ora italiana
         timestamp = now.strftime("%H:%M")
 
         report_msg = f"🕒 Report {timestamp}\n"
@@ -98,24 +93,16 @@ if __name__ == "__main__":
         for symbol in ["BTC", "ETH"]:
             price = get_price(symbol)
             if price:
-                # Salva storico ultimi 50 prezzi
                 price_history[symbol].append(price)
                 if len(price_history[symbol]) > 50:
                     price_history[symbol].pop(0)
 
-                # Calcola supporto/resistenza
                 support, resistance = calc_support_resistance(price_history[symbol])
-
-                # Check breakout/breakdown
                 check_levels(symbol, price, LEVELS[symbol], dynamic_high, dynamic_low)
 
-                # Aggiungi al report
-                report_msg += f"\n{symbol}: {price}\n"
-                report_msg += f"Supporto: {support} | Resistenza: {resistance}\n"
+                report_msg += f"\n{symbol}: {price}\nSupporto: {support} | Resistenza: {resistance}\n"
             else:
                 report_msg += f"\n{symbol}: Errore prezzo\n"
 
-        # Invia report ogni ciclo
         send_telegram_message(report_msg)
-
-        time.sleep(1800)  # report ogni 30 minuti
+        time.sleep(1800)  # Report ogni 30 minuti

@@ -1,104 +1,110 @@
-import os
 import time
 import requests
-import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
-CHECK_INTERVAL = 30  # secondi tra controlli
-REPORT_INTERVAL = 3600  # secondi per report orario
+# --- CONFIGURAZIONE ---
+TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"  # Bot Telegram
+CHAT_ID = "356760541"  # ID Telegram
 
-# --- Funzioni di supporto ---
-def send_telegram_message(message):
-    token = os.getenv("Token")
-    chat_id = os.getenv("Chat_Id")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {"chat_id": chat_id, "text": message}
+# Livelli breakout/breakdown iniziali (fissi)
+LEVELS = {
+    "BTC": {"breakout": [117700, 118300], "breakdown": [116800, 116300]},
+    "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
+}
+
+# API Binance per prezzi
+PRICE_URLS = {
+    "BTC": "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+    "ETH": "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+}
+
+# --- FUNZIONI ---
+def send_telegram_message(message: str):
+    """Invia messaggio su Telegram"""
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=data)
+        requests.post(url, data=payload, timeout=5)
     except Exception as e:
-        print("Errore invio Telegram:", e)
+        print(f"Errore invio Telegram: {e}")
 
-def get_price(symbol="BTCUSDT"):
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+def get_price(symbol: str) -> float:
+    """Ottiene prezzo corrente da Binance"""
     try:
-        response = requests.get(url, timeout=5)
-        return float(response.json()["price"])
-    except:
+        resp = requests.get(PRICE_URLS[symbol], timeout=5)
+        return float(resp.json()["price"])
+    except Exception as e:
+        print(f"Errore ottenimento prezzo {symbol}: {e}")
         return None
 
-def get_dynamic_levels(prices):
-    if len(prices) < 3:
+def calc_support_resistance(prices: list):
+    """Calcola supporto e resistenza base su ultimi prezzi"""
+    if not prices:
         return None, None
-    return min(prices), max(prices)
+    support = min(prices)
+    resistance = max(prices)
+    return support, resistance
 
-# --- Monitor per singolo simbolo ---
-def monitor_symbol(symbol, prices, last_alert):
-    price = get_price(symbol)
-    if price:
-        prices.append(price)
-        if len(prices) > 20:
-            prices.pop(0)
+def check_levels(symbol: str, price: float, levels: dict, dynamic_high: dict, dynamic_low: dict):
+    """Controlla breakout, breakdown e massimi/minimi dinamici"""
+    # Breakout fissi
+    for level in levels["breakout"]:
+        if price >= level:
+            send_telegram_message(f"🚀 BREAKOUT {symbol}: superato {level} – prezzo attuale {price}")
 
-        support, resistance = get_dynamic_levels(prices)
+    # Breakdown fissi
+    for level in levels["breakdown"]:
+        if price <= level:
+            send_telegram_message(f"⚠️ BREAKDOWN {symbol}: sotto {level} – prezzo attuale {price}")
 
-        # Reset alert se prezzo torna nella fascia neutra
-        if last_alert and support and resistance and support < price < resistance:
-            last_alert = None
+    # Massimo dinamico
+    if price > dynamic_high[symbol]:
+        dynamic_high[symbol] = price
+        send_telegram_message(f"📈 NUOVO MASSIMO {symbol}: {price}")
 
-        # Breakout dinamico
-        if resistance and price >= resistance and last_alert != "up":
-            send_telegram_message(f"🚀 {symbol} BREAKOUT: {price} (nuova resistenza {resistance})")
-            last_alert = "up"
+    # Minimo dinamico
+    if price < dynamic_low[symbol]:
+        dynamic_low[symbol] = price
+        send_telegram_message(f"📉 NUOVO MINIMO {symbol}: {price}")
 
-        # Breakdown dinamico
-        elif support and price <= support and last_alert != "down":
-            send_telegram_message(f"⚠️ {symbol} BREAKDOWN: {price} (nuovo supporto {support})")
-            last_alert = "down"
-
-    return last_alert, price
-
-# --- Funzione principale ---
-def start_bot():
-    print("=== BOT BTC/ETH AVVIATO ===")
-    send_telegram_message("✅ Bot BTC/ETH operativo 24/7: breakout, breakdown e report automatici attivi.")
-
-    btc_prices, eth_prices = [], []
-    last_alert_btc, last_alert_eth = None, None
-    last_report_time = time.time()
-
-    while True:
-        try:
-            # Monitor BTC
-            last_alert_btc, btc_price = monitor_symbol("BTCUSDT", btc_prices, last_alert_btc)
-
-            # Monitor ETH
-            last_alert_eth, eth_price = monitor_symbol("ETHUSDT", eth_prices, last_alert_eth)
-
-            # Report orario automatico
-            if time.time() - last_report_time >= REPORT_INTERVAL:
-                btc_support, btc_resistance = get_dynamic_levels(btc_prices)
-                eth_support, eth_resistance = get_dynamic_levels(eth_prices)
-                report_msg = (
-                    f"🕒 Report {datetime.now().strftime('%H:%M')}\n\n"
-                    f"BTC: {btc_price}\n"
-                    f"Supporto: {btc_support} | Resistenza: {btc_resistance}\n\n"
-                    f"ETH: {eth_price}\n"
-                    f"Supporto: {eth_support} | Resistenza: {eth_resistance}"
-                )
-                send_telegram_message(report_msg)
-                last_report_time = time.time()
-
-            time.sleep(CHECK_INTERVAL)
-
-        except Exception as e:
-            print("Errore nel ciclo principale:", e)
-            traceback.print_exc()
-            time.sleep(5)
-
+# --- MAIN ---
 if __name__ == "__main__":
+    send_telegram_message("✅ BOT ATTIVO 24/7 – Monitoraggio BTC & ETH con breakout dinamici + fissi attivati.")
+
+    # Massimi/minimi dinamici iniziali
+    dynamic_high = {"BTC": 0, "ETH": 0}
+    dynamic_low = {"BTC": 999999, "ETH": 999999}
+
+    # Lista prezzi per supporto/resistenza
+    price_history = {"BTC": [], "ETH": []}
+
     while True:
-        try:
-            start_bot()
-        except Exception as e:
-            print("Errore critico, riavvio bot:", e)
-            time.sleep(5)
+        now = datetime.utcnow() + timedelta(hours=2)  # Ora italiana (UTC+2)
+        timestamp = now.strftime("%H:%M")
+
+        report_msg = f"🕒 Report {timestamp}\n"
+
+        for symbol in ["BTC", "ETH"]:
+            price = get_price(symbol)
+            if price:
+                # Salva storico ultimi 50 prezzi
+                price_history[symbol].append(price)
+                if len(price_history[symbol]) > 50:
+                    price_history[symbol].pop(0)
+
+                # Calcola supporto/resistenza
+                support, resistance = calc_support_resistance(price_history[symbol])
+
+                # Check breakout/breakdown
+                check_levels(symbol, price, LEVELS[symbol], dynamic_high, dynamic_low)
+
+                # Aggiungi al report
+                report_msg += f"\n{symbol}: {price}\n"
+                report_msg += f"Supporto: {support} | Resistenza: {resistance}\n"
+            else:
+                report_msg += f"\n{symbol}: Errore prezzo\n"
+
+        # Invia report ogni ciclo
+        send_telegram_message(report_msg)
+
+        time.sleep(1800)  # report ogni 30 minuti

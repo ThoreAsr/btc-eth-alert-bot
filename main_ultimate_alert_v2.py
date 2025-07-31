@@ -11,17 +11,19 @@ LEVELS = {
     "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
 }
 
-VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT
-MIN_MOVE_PCT = 0.2  # % minima di superamento livello per segnale
+# Soglie volume realistiche (USDT)
+VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}
+MIN_MOVE_PCT = 0.2  # % minima di superamento livello
 
 KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
 
+# Stato segnali per evitare spam
 last_signal = {"BTC": None, "ETH": None}
 
 
 # --- FUNZIONI BASE ---
 def send_telegram_message(message: str):
-    """Invia messaggio Telegram"""
+    """Invia messaggio su Telegram"""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
     try:
@@ -93,7 +95,7 @@ def check_signal(symbol, analysis, levels):
     for level in levels["breakout"]:
         if price >= level and ema20 > ema60 and valid_break(level, price):
             if volume > vol_thresh and last_signal[symbol] != "LONG":
-                send_telegram_message(f"🟢 LONG {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
+                send_telegram_message(f"🔥 SEGNALE FORTISSIMO LONG {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
                 last_signal[symbol] = "LONG"
             elif volume <= vol_thresh:
                 send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
@@ -102,7 +104,7 @@ def check_signal(symbol, analysis, levels):
     for level in levels["breakdown"]:
         if price <= level and ema20 < ema60 and valid_break(level, price):
             if volume > vol_thresh and last_signal[symbol] != "SHORT":
-                send_telegram_message(f"🔴 SHORT {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
+                send_telegram_message(f"🔥 SEGNALE FORTISSIMO SHORT {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
                 last_signal[symbol] = "SHORT"
             elif volume <= vol_thresh:
                 send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
@@ -129,7 +131,7 @@ def build_suggestion(btc_trend, eth_trend):
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot PRO attivo – Segnali confermati con EMA + Volumi 15m (Apple Watch ready)")
+    send_telegram_message("✅ Bot PRO attivo – Segnali Fortissimi con EMA + Volumi 15m (Apple Watch ready)")
 
     while True:
         now = datetime.utcnow() + timedelta(hours=2)

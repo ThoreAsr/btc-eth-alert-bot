@@ -11,13 +11,11 @@ LEVELS = {
     "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
 }
 
-# Soglie volume realistiche (15m)
+# Soglie volume realistiche (USDT)
 VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}
 
-# Endpoint MEXC per candela 15m
 KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
 
-# Stato segnali per anti-spam
 last_signal = {"BTC": None, "ETH": None}
 
 # --- FUNZIONI ---
@@ -30,7 +28,6 @@ def send_telegram_message(message: str):
         print(f"Errore invio Telegram: {e}")
 
 def get_klines(symbol: str):
-    """Ottiene ultime 60 candele 15m da MEXC"""
     headers = {"User-Agent": "Mozilla/5.0"}
     url = KLINE_URL.format(symbol=symbol)
     try:
@@ -41,7 +38,6 @@ def get_klines(symbol: str):
         return None
 
 def calc_ema(prices, period):
-    """Calcola EMA semplice"""
     k = 2 / (period + 1)
     ema = prices[0]
     for price in prices[1:]:
@@ -49,20 +45,21 @@ def calc_ema(prices, period):
     return ema
 
 def analyze(symbol):
-    """Analizza dati per generare segnali"""
+    """Analizza ultime 60 candele 15m e calcola dati"""
     data = get_klines(symbol)
     if not data:
         send_telegram_message(f"⚠️ Errore dati {symbol}")
         return None
 
-    # Prezzi chiusura e volumi delle ultime 60 candele
-    closes = [float(c[4]) for c in data]  # prezzo close
-    volumes = [float(c[5]) for c in data]  # volume base
+    closes = [float(c[4]) for c in data]  # prezzo chiusura
+    base_volumes = [float(c[5]) for c in data]  # volume in BTC o ETH
+
+    # Calcola volume in USDT per ogni candela
+    usdt_volumes = [closes[i] * base_volumes[i] for i in range(len(closes))]
 
     last_close = closes[-1]
-    last_volume = volumes[-1]
+    last_volume = usdt_volumes[-1]  # Volume 15m in USDT
 
-    # Calcolo EMA
     ema20 = calc_ema(closes[-20:], 20)
     ema60 = calc_ema(closes[-60:], 60)
 
@@ -102,7 +99,7 @@ def check_signal(symbol, analysis, levels):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot PRO attivo 24/7 – Breakout con EMA & volumi confermati (Apple Watch ready)")
+    send_telegram_message("✅ Bot PRO attivo – Breakout confermati con EMA + Volumi 15m (Apple Watch ready)")
 
     while True:
         now = datetime.utcnow() + timedelta(hours=2)

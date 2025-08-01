@@ -1,149 +1,129 @@
 import requests
 import time
 from datetime import datetime, timedelta
-import numpy as np
 
 # --- CONFIGURAZIONE ---
-BOT_TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"  # <-- tuo token
-CHAT_ID = "-1002181919588"  # ID gruppo famiglia
+TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"  # <-- tuo token
+CHAT_ID = "-1002181919588"  # ID del gruppo Telegram
 SYMBOL_BTC = "BTCUSDT"
 SYMBOL_ETH = "ETHUSDT"
 
-# Intervalli di aggiornamento
-UPDATE_LEVELS_HOURS = 24  # aggiornamento supporti/resistenze
-REPORT_INTERVAL = 1800  # 30 minuti in secondi
+# Intervalli e EMA
+INTERVAL = 1800  # 30 minuti
+EMA_PERIODS = [20, 60]
 
-# --- FUNZIONI API MEXC ---
-def get_price_mexc(symbol):
+# URL MEXC
+MEXC_PRICE_URL = "https://api.mexc.com/api/v3/ticker/price?symbol={}"
+MEXC_VOLUME_URL = "https://api.mexc.com/api/v3/ticker/24hr?symbol={}"
+
+# Variabili dinamiche
+prices_btc = []
+prices_eth = []
+last_dynamic_update = datetime.utcnow() - timedelta(hours=24)
+dynamic_levels = {"BTC": {"support": None, "resistance": None},
+                  "ETH": {"support": None, "resistance": None}}
+
+# --- FUNZIONI ---
+def send_telegram_message(msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
-        url = f"https://api.mexc.com/api/v3/ticker/price?symbol={symbol}"
-        data = requests.get(url).json()
-        return float(data["price"])
+        requests.post(url, data=payload)
+    except Exception as e:
+        print("Errore invio Telegram:", e)
+
+def get_price(symbol):
+    try:
+        resp = requests.get(MEXC_PRICE_URL.format(symbol))
+        return float(resp.json()['price'])
     except:
         return None
 
-def get_volume_mexc(symbol):
+def get_volume(symbol):
     try:
-        url = f"https://api.mexc.com/api/v3/ticker/24hr?symbol={symbol}"
-        data = requests.get(url).json()
-        return float(data["quoteVolume"]) / 1_000_000  # in milioni
+        resp = requests.get(MEXC_VOLUME_URL.format(symbol))
+        return float(resp.json()['volume'])
     except:
         return None
 
-# --- FUNZIONI TECNICHE ---
 def calculate_ema(prices, period):
     if len(prices) < period:
         return None
-    weights = np.exp(np.linspace(-1., 0., period))
-    weights /= weights.sum()
-    ema = np.convolve(prices, weights, mode='full')[:len(prices)]
-    return ema[-1]
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    requests.post(url, data=payload)
-
-# --- LIVELLI DINAMICI ---
-dynamic_levels = {"BTC": {}, "ETH": {}}
+    weights = []
+    multiplier = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices:
+        ema = (price - ema) * multiplier + ema
+        weights.append(ema)
+    return round(ema, 2)
 
 def update_dynamic_levels():
-    btc_price = get_price_mexc(SYMBOL_BTC)
-    eth_price = get_price_mexc(SYMBOL_ETH)
+    global dynamic_levels
+    if prices_btc:
+        max_btc = max(prices_btc[-60:])
+        min_btc = min(prices_btc[-60:])
+        dynamic_levels["BTC"]["support"] = round(min_btc, 2)
+        dynamic_levels["BTC"]["resistance"] = round(max_btc, 2)
+    if prices_eth:
+        max_eth = max(prices_eth[-60:])
+        min_eth = min(prices_eth[-60:])
+        dynamic_levels["ETH"]["support"] = round(min_eth, 2)
+        dynamic_levels["ETH"]["resistance"] = round(max_eth, 2)
 
-    if btc_price:
-        dynamic_levels["BTC"]["support"] = btc_price * 0.98
-        dynamic_levels["BTC"]["resistance"] = btc_price * 1.02
-    if eth_price:
-        dynamic_levels["ETH"]["support"] = eth_price * 0.98
-        dynamic_levels["ETH"]["resistance"] = eth_price * 1.02
+def generate_signal(price, ema20, ema60):
+    if ema20 and ema60:
+        if price > ema20 > ema60:
+            return "LONG"
+        elif price < ema20 < ema60:
+            return "SHORT"
+    return "NESSUN SEGNALE"
 
-    send_telegram_message("🔄 <b>Livelli dinamici aggiornati</b>")
-
-# --- SEGNALI OPERATIVI ---
-def generate_signal(price, ema20, ema60, support, resistance, vol):
-    if None in [ema20, ema60, support, resistance, vol]:
-        return "Nessun segnale"
-
-    # Logica LONG
-    if price > ema20 and price > ema60 and price > resistance and vol > 5:
-        return "💚 <b>Segnale LONG forte</b>"
-
-    # Logica SHORT
-    if price < ema20 and price < ema60 and price < support and vol > 5:
-        return "❤️ <b>Segnale SHORT forte</b>"
-
-    return "Nessun segnale"
-
-# --- LOOP PRINCIPALE ---
-prices_btc = []
-prices_eth = []
-
-send_telegram_message("✅ <b>Bot PRO+ avviato – Prezzo & volumi MEXC, 2 EMA e TP multipli</b>")
-update_dynamic_levels()
-
-last_update = datetime.utcnow()
-last_report_time = 0
+# --- MAIN LOOP ---
+send_telegram_message("✅ Bot ATTIVO – Prezzo & volumi MEXC, 2 EMA e TP multipli")
 
 while True:
-    # Aggiorna livelli dinamici ogni 24 ore
-    if datetime.utcnow() - last_update > timedelta(hours=UPDATE_LEVELS_HOURS):
-        update_dynamic_levels()
-        last_update = datetime.utcnow()
+    now = datetime.utcnow()
 
-    # Recupera prezzi e volumi
-    btc_price = get_price_mexc(SYMBOL_BTC)
-    eth_price = get_price_mexc(SYMBOL_ETH)
-    btc_vol = get_volume_mexc(SYMBOL_BTC)
-    eth_vol = get_volume_mexc(SYMBOL_ETH)
+    # Aggiorna livelli dinamici ogni 24 ore
+    if now - last_dynamic_update > timedelta(hours=24):
+        update_dynamic_levels()
+        last_dynamic_update = now
+        send_telegram_message("🔄 Livelli dinamici aggiornati")
+
+    # Recupero dati
+    btc_price = get_price(SYMBOL_BTC)
+    eth_price = get_price(SYMBOL_ETH)
+    btc_vol = get_volume(SYMBOL_BTC)
+    eth_vol = get_volume(SYMBOL_ETH)
 
     if btc_price and eth_price:
         prices_btc.append(btc_price)
         prices_eth.append(eth_price)
 
-    # Mantieni solo ultimi 200 prezzi
-    prices_btc = prices_btc[-200:]
-    prices_eth = prices_eth[-200:]
+        # Mantieni ultimi 200 prezzi
+        prices_btc[:] = prices_btc[-200:]
+        prices_eth[:] = prices_eth[-200:]
 
-    # Calcolo EMA
-    btc_ema20 = calculate_ema(prices_btc, 20)
-    btc_ema60 = calculate_ema(prices_btc, 60)
-    eth_ema20 = calculate_ema(prices_eth, 20)
-    eth_ema60 = calculate_ema(prices_eth, 60)
+        # Calcola EMA
+        btc_ema20 = calculate_ema(prices_btc, 20)
+        btc_ema60 = calculate_ema(prices_btc, 60)
+        eth_ema20 = calculate_ema(prices_eth, 20)
+        eth_ema60 = calculate_ema(prices_eth, 60)
 
-    # Genera segnali
-    btc_signal = generate_signal(
-        btc_price, btc_ema20, btc_ema60,
-        dynamic_levels["BTC"].get("support"),
-        dynamic_levels["BTC"].get("resistance"),
-        btc_vol
-    )
+        # Segnali
+        btc_signal = generate_signal(btc_price, btc_ema20, btc_ema60)
+        eth_signal = generate_signal(eth_price, eth_ema20, eth_ema60)
 
-    eth_signal = generate_signal(
-        eth_price, eth_ema20, eth_ema60,
-        dynamic_levels["ETH"].get("support"),
-        dynamic_levels["ETH"].get("resistance"),
-        eth_vol
-    )
+        # Messaggio
+        msg = (
+            f"🕒 Report {now.strftime('%H:%M')} UTC\n\n"
+            f"<b>BTC:</b> {btc_price}$ | EMA20:{btc_ema20} | EMA60:{btc_ema60} | Vol:{btc_vol}M\n"
+            f"{'Segnale: ' + btc_signal if btc_signal else 'Nessun segnale'}\n\n"
+            f"<b>ETH:</b> {eth_price}$ | EMA20:{eth_ema20} | EMA60:{eth_ema60} | Vol:{eth_vol}M\n"
+            f"{'Segnale: ' + eth_signal if eth_signal else 'Nessun segnale'}"
+        )
 
-    # Invio report ogni 30 min
-    current_time = time.time()
-    if current_time - last_report_time >= REPORT_INTERVAL:
-        msg = f"🕒 <b>Report {datetime.utcnow().strftime('%H:%M')} UTC</b>\n\n"
-        msg += f"<b>BTC:</b> {btc_price}$ | EMA20:{btc_ema20} | EMA60:{btc_ema60} | Vol:{btc_vol}M\n{btc_signal}\n\n"
-        msg += f"<b>ETH:</b> {eth_price}$ | EMA20:{eth_ema20} | EMA60:{eth_ema60} | Vol:{eth_vol}M\n{eth_signal}"
         send_telegram_message(msg)
-        last_report_time = current_time
 
-    # Alert istantanei in caso di breakout
-    if btc_price and dynamic_levels["BTC"].get("resistance") and btc_price > dynamic_levels["BTC"]["resistance"]:
-        send_telegram_message(f"🚀 <b>BREAKOUT BTC!</b> Prezzo: {btc_price}$")
-    elif btc_price and dynamic_levels["BTC"].get("support") and btc_price < dynamic_levels["BTC"]["support"]:
-        send_telegram_message(f"⚠️ <b>BREAKDOWN BTC!</b> Prezzo: {btc_price}$")
-
-    if eth_price and dynamic_levels["ETH"].get("resistance") and eth_price > dynamic_levels["ETH"]["resistance"]:
-        send_telegram_message(f"🚀 <b>BREAKOUT ETH!</b> Prezzo: {eth_price}$")
-    elif eth_price and dynamic_levels["ETH"].get("support") and eth_price < dynamic_levels["ETH"]["support"]:
-        send_telegram_message(f"⚠️ <b>BREAKDOWN ETH!</b> Prezzo: {eth_price}$")
-
-    time.sleep(30)  # Controllo ogni 30 secondi
+    # Aspetta 30 minuti
+    time.sleep(INTERVAL)

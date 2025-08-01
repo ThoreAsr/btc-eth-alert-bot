@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 
 # --- CONFIGURAZIONE ---
 TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
-CHAT_ID = "356760541"
+CHAT_ID = "-1002181919588"
+
 
 LEVELS = {
     "BTC": {"breakout": [117700, 118300], "breakdown": [116800, 116300]},

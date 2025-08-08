@@ -1,6 +1,7 @@
 import time
 import requests
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # per gestire fusi orari
 
 # --- CONFIGURAZIONE ---
 TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
@@ -11,22 +12,17 @@ LEVELS = {
     "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
 }
 
-# Soglie per volume della CANDLA 15m (USDT) -> coerenti con i dati MEXC (non CMC!)
-VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}
-MIN_MOVE_PCT = 0.2   # % minima superamento livello
-TP_PCT = 1.0         # Target +1%
-SL_PCT = 0.3         # Stop -0.3%
-KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
+VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT
+MIN_MOVE_PCT = 0.2  # % minima superamento livello
+TP_PCT = 1.0        # Target +1%
+SL_PCT = 0.3        # Stop -0.3%
 
-# CoinMarketCap (volumi globali informativi)
-CMC_API_KEY = "e1bf46bf-1e42-4c30-8847-c011f772dcc8"
-CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
 
 # Stato segnali
 last_signal = {"BTC": None, "ETH": None}
 active_trade = {"BTC": None, "ETH": None}  # Salva target e stop
-last_weak_alert = {"BTC_breakout": 0, "BTC_breakdown": 0, "ETH_breakout": 0, "ETH_breakdown": 0}
-WEAK_ALERT_COOLDOWN = 600  # 10 minuti
+
 
 # --- FUNZIONI BASE ---
 def send_telegram_message(message: str):
@@ -37,29 +33,17 @@ def send_telegram_message(message: str):
     except Exception as e:
         print(f"Errore invio Telegram: {e}")
 
+
 def get_klines(symbol: str):
     headers = {"User-Agent": "Mozilla/5.0"}
     url = KLINE_URL.format(symbol=symbol)
     try:
-        resp = requests.get(url, headers=headers, timeout=7)
-        resp.raise_for_status()
+        resp = requests.get(url, headers=headers, timeout=5)
         return resp.json()
     except Exception as e:
         print(f"Errore klines {symbol}: {e}")
         return None
 
-def get_cmc_volume(symbol: str):
-    """Volume globale 24h (USD) da CMC – SOLO per report informativo."""
-    try:
-        params = {"symbol": symbol, "convert": "USD"}
-        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
-        r = requests.get(CMC_URL, params=params, headers=headers, timeout=7)
-        r.raise_for_status()
-        data = r.json()
-        return float(data["data"][symbol]["quote"]["USD"]["volume_24h"])
-    except Exception as e:
-        print(f"Errore CMC {symbol}: {e}")
-        return None
 
 def calc_ema(prices, period):
     k = 2 / (period + 1)
@@ -67,6 +51,7 @@ def calc_ema(prices, period):
     for price in prices[1:]:
         ema = price * k + ema * (1 - k)
     return ema
+
 
 # --- ANALISI DATI ---
 def analyze(symbol):
@@ -76,25 +61,21 @@ def analyze(symbol):
         return None
 
     closes = [float(c[4]) for c in data]
-    base_volumes = [float(c[5]) for c in data]   # volume in "base asset"
-    usdt_volumes = [closes[i] * base_volumes[i] for i in range(len(closes))]  # convertito in USDT
+    base_volumes = [float(c[5]) for c in data]
+    usdt_volumes = [closes[i] * base_volumes[i] for i in range(len(closes))]
 
     last_close = closes[-1]
-    last_volume_15m = usdt_volumes[-1]
+    last_volume = usdt_volumes[-1]
     ema20 = calc_ema(closes[-20:], 20)
     ema60 = calc_ema(closes[-60:], 60)
 
-    # Volume globale 24h (solo per report)
-    cmc_symbol = "BTC" if symbol == "BTC" else "ETH"
-    cmc_vol_24h = get_cmc_volume(cmc_symbol)
-
     return {
         "price": last_close,
-        "volume_15m": last_volume_15m,  # usato per i segnali (coerente con soglie)
-        "volume_24h_global": cmc_vol_24h,  # informativo
+        "volume": last_volume,
         "ema20": ema20,
         "ema60": ema60
     }
+
 
 # --- SEGNALI E TRADE ---
 def open_trade(symbol, direction, entry_price):
@@ -117,6 +98,7 @@ def open_trade(symbol, direction, entry_price):
         f"🔥 SEGNALE FORTISSIMO {direction} {symbol}\n"
         f"Entra: {round(entry_price,2)} | Target: {round(tp,2)} | Stop: {round(sl,2)}"
     )
+
 
 def monitor_trade(symbol, price):
     """Controlla se target o stop vengono colpiti"""
@@ -146,17 +128,11 @@ def monitor_trade(symbol, price):
             send_telegram_message(f"❌ STOP colpito SHORT {symbol} a {round(sl,2)}")
             active_trade[symbol] = None
 
-def _cooldown_ok(key: str) -> bool:
-    now = time.time()
-    if now - last_weak_alert.get(key, 0) >= WEAK_ALERT_COOLDOWN:
-        last_weak_alert[key] = now
-        return True
-    return False
 
 def check_signal(symbol, analysis, levels):
     global last_signal
     price = analysis["price"]
-    volume_15m = analysis["volume_15m"]  # 15m MEXC (USDT)
+    volume = analysis["volume"]
     ema20 = analysis["ema20"]
     ema60 = analysis["ema60"]
 
@@ -168,42 +144,31 @@ def check_signal(symbol, analysis, levels):
     # Breakout LONG
     for level in levels["breakout"]:
         if price >= level and ema20 > ema60 and valid_break(level, price):
-            if volume_15m > vol_thresh and last_signal[symbol] != "LONG":
+            if volume > vol_thresh and last_signal[symbol] != "LONG":
                 open_trade(symbol, "LONG", price)
                 last_signal[symbol] = "LONG"
-            elif volume_15m <= vol_thresh:
-                key = f"{symbol}_breakout"
-                if _cooldown_ok(key):
-                    send_telegram_message(
-                        f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol 15m {round(volume_15m/1e6,1)}M"
-                    )
+            elif volume <= vol_thresh:
+                send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
 
     # Breakdown SHORT
     for level in levels["breakdown"]:
         if price <= level and ema20 < ema60 and valid_break(level, price):
-            if volume_15m > vol_thresh and last_signal[symbol] != "SHORT":
+            if volume > vol_thresh and last_signal[symbol] != "SHORT":
                 open_trade(symbol, "SHORT", price)
                 last_signal[symbol] = "SHORT"
-            elif volume_15m <= vol_thresh:
-                key = f"{symbol}_breakdown"
-                if _cooldown_ok(key):
-                    send_telegram_message(
-                        f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol 15m {round(volume_15m/1e6,1)}M"
-                    )
+            elif volume <= vol_thresh:
+                send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
 
     # Reset segnale se neutro
     if levels["breakdown"][-1] < price < levels["breakout"][0]:
         last_signal[symbol] = None
 
+
 # --- REPORT TREND ---
-def format_report_line(symbol, price, ema20, ema60, volume_15m, vol24h_global):
+def format_report_line(symbol, price, ema20, ema60, volume):
     trend = "🟢" if ema20 > ema60 else "🔴" if ema20 < ema60 else "⚪"
-    v15 = f"{round(volume_15m/1e6,1)}M" if volume_15m is not None else "n/a"
-    v24 = f"{round(vol24h_global/1e9,2)}B 24h" if vol24h_global else "n/a"
-    return (
-        f"{trend} {symbol}: {round(price,2)}$ | EMA20:{round(ema20,2)} | "
-        f"EMA60:{round(ema60,2)} | Vol15m:{v15} | Global:{v24}"
-    ), trend
+    return f"{trend} {symbol}: {round(price,2)}$ | EMA20:{round(ema20,2)} | EMA60:{round(ema60,2)} | Vol:{round(volume/1e6,1)}M"
+
 
 def build_suggestion(btc_trend, eth_trend):
     if btc_trend == "🟢" and eth_trend == "🟢":
@@ -213,14 +178,15 @@ def build_suggestion(btc_trend, eth_trend):
     else:
         return "Suggerimento: Trend misto – Attendere conferma ⚠️"
 
+
 # --- MAIN LOOP ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot PRO attivo – Segnali Forti con TP/SL dinamici (Apple Watch ready)")
+    send_telegram_message("✅ Bot PRO attivo – Segnali Fortissimi con TP/SL dinamici (Apple Watch ready)")
 
     while True:
-        # ORA UTC CORRETTA (niente +2)
-        timestamp = datetime.utcnow().strftime("%H:%M")
-        report_msg = f"🕒 Report {timestamp} UTC\n"
+        now_it = datetime.now(tz=ZoneInfo("Europe/Rome")).strftime("%H:%M")
+        now_utc = datetime.now(tz=ZoneInfo("UTC")).strftime("%H:%M")
+        report_msg = f"🕒 Report {now_it} (Italia) | {now_utc} UTC\n"
 
         trends = {}
 
@@ -228,24 +194,26 @@ if __name__ == "__main__":
             analysis = analyze(symbol)
             if analysis:
                 price = analysis["price"]
-                vol15 = analysis["volume_15m"]
-                vol24 = analysis["volume_24h_global"]
+                volume = analysis["volume"]
                 ema20 = analysis["ema20"]
                 ema60 = analysis["ema60"]
 
-                # Controlla segnali & monitora eventuale trade aperto
+                # Controlla segnali
                 check_signal(symbol, analysis, LEVELS[symbol])
+
+                # Monitora eventuale trade aperto
                 monitor_trade(symbol, price)
 
-                # Riga report + trend
-                line, trend_emoji = format_report_line(symbol, price, ema20, ema60, vol15, vol24)
+                # Aggiungi trend
+                trend_emoji = "🟢" if ema20 > ema60 else "🔴" if ema20 < ema60 else "⚪"
                 trends[symbol] = trend_emoji
-                report_msg += f"\n{line}"
+
+                report_msg += f"\n{format_report_line(symbol, price, ema20, ema60, volume)}"
             else:
                 report_msg += f"\n{symbol}: Errore dati"
                 trends[symbol] = "⚪"
 
-        # Suggerimento operativo finale
+        # Aggiungi suggerimento operativo
         report_msg += f"\n\n{build_suggestion(trends['BTC'], trends['ETH'])}"
 
         send_telegram_message(report_msg)

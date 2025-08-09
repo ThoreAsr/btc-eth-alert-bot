@@ -1,54 +1,62 @@
-# ================== BTC/ETH ULTIMATE BOT (SNELLO, NO-SPAM) ==================
+# ================= BTC/ETH ULTIMATE BOT (CLEAN) =================
 # Dipendenze: requests
 import time, hashlib, requests
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-# ----------------------- CONFIGURA QUI -----------------------
+# --- Fuso Italia con fallback se zoneinfo non disponibile ---
+try:
+    from zoneinfo import ZoneInfo
+    Z_ITALY = ZoneInfo("Europe/Rome")
+    Z_UTC   = ZoneInfo("UTC")
+    def now_it():  return datetime.now(Z_ITALY)
+    def now_utc(): return datetime.now(Z_UTC)
+except Exception:
+    def now_it():  return datetime.utcnow() + timedelta(hours=2)  # fallback estivo
+    def now_utc(): return datetime.utcnow()
+
+# ----------------------- CONFIGURAZIONE ------------------------
 TOKEN   = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
 CHAT_ID = "-1002181919588"
 
-# Prezzo/volumi da MEXC 15m
+# Dati da MEXC 15m
 KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={s}USDT&interval=15m&limit=120"
 
-# Filtri/parametri segnali forti
-VOL_MULT      = 1.30   # vol15m >= VOL_MULT * media vol (12h)
-TP_PCT        = 1.0    # target %
-SL_PCT        = 0.3    # stop %
-STRONG_COOLD  = 15*60  # cooldown segnali forti per simbolo/direzione
-REPORT_MIN_GAP= 14*60  # minimo tra due report identici
+# Filtri segnali forti
+VOL_MULT       = 1.30     # vol15m >= VOL_MULT * media vol (12h)
+TP_PCT         = 1.00     # target %
+SL_PCT         = 0.30     # stop  %
+STRONG_COOLD   = 15*60    # cooldown per simbolo/direzione
+REPORT_MIN_GAP = 14*60    # minimo tra due report identici
+POLL_SLEEP     = 5        # pausa loop
+# ---------------------------------------------------------------
 
-# Frequenza report (scheduler su :00 e :30)
-POLL_SLEEP    = 5      # sec tra i cicli del loop
-# -------------------------------------------------------------
-
-# Stato runtime
+# Stato runtime (in memoria)
 STATE = {
-    "BTC": {"strong_dir": None, "strong_ts": 0.0, "trade": None, "last_sig_hash":None},
-    "ETH": {"strong_dir": None, "strong_ts": 0.0, "trade": None, "last_sig_hash":None},
+    "BTC": {"last_hash": None, "cool_ts": 0.0, "dir": None, "trade": None},
+    "ETH": {"last_hash": None, "cool_ts": 0.0, "dir": None, "trade": None},
 }
 LAST_REPORT_HASH = None
 LAST_REPORT_TS   = 0.0
 STARTUP_SENT     = False
 
-# -------------------- TELEGRAM --------------------
-def tg(text: str):
+# ------------------------- TELEGRAM ----------------------------
+def tg(msg: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text},
+            data={"chat_id": CHAT_ID, "text": msg},
             timeout=8
         )
     except Exception:
         pass
 
-# -------------------- DATA ------------------------
+# --------------------------- DATI ------------------------------
 def klines(sym):
     try:
         r = requests.get(
             KLINE_URL.format(s=sym),
             headers={"User-Agent": "ok"},
-            timeout=12,
+            timeout=12
         )
         r.raise_for_status()
         return r.json()
@@ -80,8 +88,7 @@ def macd_hist(cl):
 
 def analyze(sym):
     d = klines(sym)
-    if not d or len(d) < 60:
-        return None
+    if not d or len(d) < 60: return None
 
     op=[float(c[1]) for c in d]
     hi=[float(c[2]) for c in d]
@@ -95,14 +102,13 @@ def analyze(sym):
     atr20 = atr(cl[-60:], hi[-60:], lo[-60:], 20)
     hist  = macd_hist(cl[-120:])
 
-    # livelli dinamici: swing 24h + bande EMA20±ATR
-    swing_hi = max(hi[-96:])
+    swing_hi = max(hi[-96:])  # 24h
     swing_lo = min(lo[-96:])
     bo = sorted({round(swing_hi,2), round(ema20[-1] + atr20,2)})
     bd = sorted({round(swing_lo,2), round(ema20[-1] - atr20,2)}, reverse=True)
 
     vol15 = usdt[-1]
-    avg12 = sum(usdt[-48:])/48
+    avg12 = sum(usdt[-48:])/48  # 12h
 
     return {
         "price": cl[-1], "open": op[-1],
@@ -114,13 +120,13 @@ def analyze(sym):
         "levels": {"bo": bo, "bd": bd}
     }
 
-# -------------------- TRADE MGMT -------------------
+# --------------------- TRADE MANAGEMENT -----------------------
 def open_trade(sym, side, entry):
     if side=="LONG":
         tp = entry*(1+TP_PCT/100); sl = entry*(1-SL_PCT/100)
     else:
         tp = entry*(1-TP_PCT/100); sl = entry*(1+SL_PCT/100)
-    STATE[sym]["trade"] = {"side":side,"entry":entry,"tp":tp,"sl":sl}
+    STATE[sym]["trade"] = {"side":side, "entry":entry, "tp":tp, "sl":sl}
     tg(f"🔥 SEGNALE FORTISSIMO {side} {sym}\nEntra: {entry:.2f} | Target: {tp:.2f} | Stop: {sl:.2f}")
 
 def monitor(sym, price):
@@ -133,9 +139,8 @@ def monitor(sym, price):
         if price <= t["tp"]: tg(f"✅ TP SHORT {sym} a {t['tp']:.2f}"); STATE[sym]["trade"]=None
         elif price >= t["sl"]: tg(f"❌ STOP SHORT {sym} a {t['sl']:.2f}"); STATE[sym]["trade"]=None
 
-# -------------------- SIGNAL LOGIC (solo FORTI) ----
+# ----------------------- SIGNALI FORTI ------------------------
 def strong_signal(sym, a):
-    """Ritorna 'LONG'/'SHORT' oppure None"""
     p=a["price"]; e20=a["ema20"]; e20p=a["ema20p"]; e60=a["ema60"]
     hist=a["hist"]; bull=a["bull"]; bear=a["bear"]
     v=a["vol15"]; avg=a["avg12"]; lv=a["levels"]
@@ -145,40 +150,32 @@ def strong_signal(sym, a):
     for L in lv["bo"]:
         if p>=L and e20>e60 and e20>e20p and bull and hist>0 and p>=e20 and vol_ok:
             return "LONG"
-        break  # evita più valutazioni nello stesso ciclo
-
+        break
     # SHORT forte
     for L in lv["bd"]:
         if p<=L and e20<e60 and e20<e20p and bear and hist<0 and p<=e20 and vol_ok:
             return "SHORT"
         break
-
     return None
 
-def maybe_send_signal(sym, a):
+def maybe_signal(sym, a):
     side = strong_signal(sym, a)
-    if not side: 
-        # reset se prezzo torna in zona neutra
+    if not side:
+        # reset in zona neutra
         p=a["price"]; lv=a["levels"]
-        if max(lv["bd"]) < p < min(lv["bo"]): STATE[sym]["strong_dir"]=None
+        if max(lv["bd"]) < p < min(lv["bo"]): STATE[sym]["dir"]=None
         return
-
+    # anti-duplicato + cooldown
     now=time.time()
-    if STATE[sym]["strong_dir"] == side and (now-STATE[sym]["strong_ts"]) < STRONG_COOLD:
+    if STATE[sym]["dir"]==side and (now-STATE[sym]["cool_ts"])<STRONG_COOLD:
         return
-
-    # dedup per contenuto (hash)
-    sig_text = f"{sym}|{side}|{a['price']:.2f}|{a['ema20']:.2f}|{a['ema60']:.2f}"
-    h = hashlib.sha1(sig_text.encode()).hexdigest()
-    if h == STATE[sym]["last_sig_hash"] and (now-STATE[sym]["strong_ts"]) < STRONG_COOLD:
+    h = hashlib.sha1(f"{sym}|{side}|{a['price']:.2f}".encode()).hexdigest()
+    if h==STATE[sym]["last_hash"] and (now-STATE[sym]["cool_ts"])<STRONG_COOLD:
         return
-
     open_trade(sym, side, a["price"])
-    STATE[sym]["strong_dir"]  = side
-    STATE[sym]["strong_ts"]   = now
-    STATE[sym]["last_sig_hash"]= h
+    STATE[sym]["dir"]=side; STATE[sym]["cool_ts"]=now; STATE[sym]["last_hash"]=h
 
-# -------------------- REPORT -----------------------
+# -------------------------- REPORT ----------------------------
 def trend_emoji(e20,e60): return "🟢" if e20>e60 else ("🔴" if e20<e60 else "⚪")
 
 def report_line(sym, a):
@@ -188,16 +185,12 @@ def report_line(sym, a):
 
 def build_report():
     A = {s: analyze(s) for s in ["BTC","ETH"]}
-    if not A["BTC"] or not A["ETH"]:
-        return None, None
-
-    it  = datetime.now(ZoneInfo("Europe/Rome")).strftime("%d/%m %H:%M")
-    utc = datetime.now(ZoneInfo("UTC")).strftime("%d/%m %H:%M")
-
+    if not A["BTC"] or not A["ETH"]: return None, None
+    it  = now_it().strftime("%d/%m %H:%M")
+    utc = now_utc().strftime("%d/%m %H:%M")
     text = (f"🕒 Report {it} (Italia) | {utc} UTC\n\n"
             f"{report_line('BTC',A['BTC'])}\n"
             f"{report_line('ETH',A['ETH'])}")
-
     b = trend_emoji(A["BTC"]["ema20"], A["BTC"]["ema60"])
     e = trend_emoji(A["ETH"]["ema20"], A["ETH"]["ema60"])
     if   b=="🟢" and e=="🟢": sug="Preferenza LONG ✅"
@@ -215,35 +208,33 @@ def send_report_no_dup():
     if h==LAST_REPORT_HASH and (now-LAST_REPORT_TS)<REPORT_MIN_GAP:
         return
     tg(text)
-    LAST_REPORT_HASH, LAST_REPORT_TS = h, now
-    # dopo il report, controlla anche i trade
+    LAST_REPORT_HASH=h; LAST_REPORT_TS=now
+    # monitora TP/SL subito dopo
     for s in ["BTC","ETH"]:
         monitor(s, A[s]["price"])
 
-# -------------------- SCHEDULER --------------------
+# ------------------------ SCHEDULER ---------------------------
 def next_half_hour_ts():
-    now = datetime.now(ZoneInfo("UTC")).replace(second=0, microsecond=0)
-    add = 30 - (now.minute % 30)
-    if add == 0: add = 30
-    return (now + timedelta(minutes=add)).timestamp()
+    t = now_utc().replace(second=0, microsecond=0)
+    add = 30 - (t.minute % 30)
+    if add==0: add=30
+    return (t + timedelta(minutes=add)).timestamp()
 
-# -------------------- MAIN -------------------------
+# --------------------------- MAIN -----------------------------
 if not STARTUP_SENT:
     tg("✅ Bot PRO attivo – Segnali Forti con TP/SL dinamici (Apple Watch ready)")
-    STARTUP_SENT = True
+    STARTUP_SENT=True
 
-next_report = next_half_hour_ts()  # primo alle :00/:30
+next_report = next_half_hour_ts()
 
 while True:
     try:
-        # 1) Analizza e gestisce segnali SOLO forti (no debole)
         for s in ["BTC","ETH"]:
-            A = analyze(s)
-            if not A: continue
-            maybe_send_signal(s, A)
-            monitor(s, A["price"])  # protezione TP/SL durante il ciclo
+            a = analyze(s)
+            if not a: continue
+            maybe_signal(s, a)
+            monitor(s, a["price"])
 
-        # 2) Report sincronizzato
         if time.time() >= next_report:
             send_report_no_dup()
             next_report = next_half_hour_ts()
@@ -251,5 +242,4 @@ while True:
         time.sleep(POLL_SLEEP)
 
     except Exception:
-        # in caso di errore transitorio non spammare, riprova
         time.sleep(10)

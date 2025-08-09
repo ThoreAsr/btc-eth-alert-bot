@@ -184,8 +184,9 @@ def next_half_hour_epoch() -> float:
     return target.timestamp()
 
 # --- MAIN ---
+# --- MAIN ---
 if __name__ == "__main__":
-    global STARTUP_MESSAGE_SENT
+    # niente 'global' qui: siamo già nel modulo
     if not STARTUP_MESSAGE_SENT:
         send_telegram_message("✅ Bot PRO attivo – Segnali Fortissimi con TP/SL dinamici (Apple Watch ready)")
         STARTUP_MESSAGE_SENT = True
@@ -194,37 +195,43 @@ if __name__ == "__main__":
     next_report_ts = next_half_hour_epoch()
 
     while True:
-        # analisi e segnali
-        for sym in ["BTC", "ETH"]:
-            a = analyze(sym)
-            if not a:
-                continue
-            check_signal(sym, a, LEVELS[sym])
-            monitor_trade(sym, a["price"])
-
-        # report ogni :00 / :30
-        now_utc = time.time()
-        if now_utc >= next_report_ts:
-            now_it_str = datetime.now(tz=ZoneInfo("Europe/Rome")).strftime("%d/%m %H:%M")
-            now_utc_str = datetime.now(tz=ZoneInfo("UTC")).strftime("%d/%m %H:%M")
-
-            report = f"🕒 Report {now_it_str} (Italia) | {now_utc_str} UTC\n"
-            trends = {}
-
+        try:
+            # analisi e segnali (polling leggero)
             for sym in ["BTC", "ETH"]:
                 a = analyze(sym)
-                if a:
-                    line = format_report_line(sym, a["price"], a["ema20"], a["ema60"], a["volume"])
-                    report += f"\n{line}"
-                    trends[sym] = "🟢" if a["ema20"] > a["ema60"] else "🔴" if a["ema20"] < a["ema60"] else "⚪"
-                else:
-                    report += f"\n{sym}: Errore dati"
-                    trends[sym] = "⚪"
+                if not a:
+                    continue
+                check_signal(sym, a, LEVELS[sym])
+                monitor_trade(sym, a["price"])
 
-            report += f"\n\n{build_suggestion(trends['BTC'], trends['ETH'])}"
-            send_telegram_message(report)
+            # report ogni :00 / :30
+            now_utc = time.time()
+            if now_utc >= next_report_ts:
+                now_it_str = datetime.now(tz=ZoneInfo("Europe/Rome")).strftime("%d/%m %H:%M")
+                now_utc_str = datetime.now(tz=ZoneInfo("UTC")).strftime("%d/%m %H:%M")
 
-            # prossimo :00 o :30
-            next_report_ts = next_half_hour_epoch() + 1  # +1s per sicurezza
+                report = f"🕒 Report {now_it_str} (Italia) | {now_utc_str} UTC\n"
+                trends = {}
 
-        time.sleep(5)  # polling leggero
+                for sym in ["BTC", "ETH"]:
+                    a = analyze(sym)
+                    if a:
+                        line = format_report_line(sym, a["price"], a["ema20"], a["ema60"], a["volume"])
+                        report += f"\n{line}"
+                        trends[sym] = "🟢" if a["ema20"] > a["ema60"] else "🔴" if a["ema20"] < a["ema60"] else "⚪"
+                    else:
+                        report += f"\n{sym}: Errore dati"
+                        trends[sym] = "⚪"
+
+                report += f"\n\n{build_suggestion(trends['BTC'], trends['ETH'])}"
+                send_telegram_message(report)
+
+                # prossimo :00 o :30
+                next_report_ts = next_half_hour_epoch() + 1  # +1s per sicurezza
+
+            time.sleep(5)  # polling leggero
+
+        except Exception as e:
+            # Paracadute per errori temporanei: NON far morire il processo
+            log(f"Loop error: {e}")
+            time.sleep(10)

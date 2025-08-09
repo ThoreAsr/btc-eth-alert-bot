@@ -1,220 +1,286 @@
-# ================ BTC/ETH VOLUMES-ONLY BOT (Italy time, clean) ================
-# Dipendenze: requests
-import time, hashlib, requests
+# main_ultimate_alert_v2.py
+# Bot BTC/ETH – breakout dinamici + volumi 15m con rapporto, TP/SL dinamici
+# Report ogni 30 minuti (solo orario Italia). Segnali Apple-Watch friendly.
+
+import time
+import math
+import requests
 from datetime import datetime, timedelta
 
-# ---- Orario Italia (con fallback se zoneinfo non disponibile) ----
-try:
-    from zoneinfo import ZoneInfo
-    Z_ITALY = ZoneInfo("Europe/Rome")
-    def now_it():  return datetime.now(Z_ITALY)
-except Exception:
-    def now_it():  return datetime.utcnow() + timedelta(hours=2)  # fallback estivo
+# =============== CONFIG =================
 
-# --------------------------- CONFIG --------------------------------
 TOKEN   = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
 CHAT_ID = "-1002181919588"
 
-KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={s}USDT&interval=15m&limit=120"
+# Opzionale (oggi non obbligatorio). Lasciare "" se non usi conferma CMC.
+CMC_API_KEY = ""   # es. "e1bf46bf-...."  (se vuoto: ignorato)
 
-# Volumi & trade
-VOL_MULT       = 1.30   # vol15m deve essere >= 1.30 * media 12h
-TP_PCT         = 1.00   # target %
-SL_PCT         = 0.30   # stop   %
+# Prezzi/volumi 15m da MEXC
+KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit={limit}"
 
-# Anti-spam
-STRONG_COOLD   = 15*60  # 15 minuti tra due segnali forti dello stesso tipo
-REPORT_MIN_GAP = 14*60  # non reinviare lo stesso report identico entro 14 min
-POLL_SLEEP     = 5      # secondi tra un ciclo e l'altro
+SYMBOLS = ["BTC", "ETH"]
 
-# --------------------------- STATO ---------------------------------
-STATE = {
-    "BTC": {"last_sig_hash": None, "cool_ts": 0.0, "dir": None, "trade": None},
-    "ETH": {"last_sig_hash": None, "cool_ts": 0.0, "dir": None, "trade": None},
-}
-LAST_REPORT_HASH = None
-LAST_REPORT_TS   = 0.0
-STARTUP_SENT     = False
+# Livelli dinamici (massimo/minimo lookback) e sensibilità breakout
+LOOKBACK_BARS   = 96           # ~24 ore su 15m
+MIN_MOVE_PCT    = 0.15         # % minima oltre il livello dinamico per contare come breakout
 
-# ------------------------- TELEGRAM --------------------------------
-def tg(msg: str):
+# Volumi: soglia forza / rapporto vol/avg
+VOL_AVG_BARS    = 32           # media 15m per confronto
+VOL_STRONG_X    = 1.30         # >= 1.30x media => forte
+VOL_WEAK_X      = 1.05         # 1.05–1.30x => debole (se <1.05x non segnaliamo)
+
+# TP/SL dinamici
+TP_PCT = 0.80                   # 0.80% target
+SL_PCT = 0.35                   # 0.35% stop
+
+# Report & antispam
+REPORT_EVERY_SEC   = 30 * 60    # ogni 30 minuti
+SIGNAL_COOLDOWN_S  = 10 * 60    # non ripetere lo stesso segnale per 10 minuti
+
+# =======================================
+
+
+# Stato in memoria
+last_report_ts = 0
+last_signal = {s: {"dir": None, "ts": 0} for s in SYMBOLS}
+
+# Banner avvio una sola volta
+STARTUP_SENT = False
+
+
+# ---------- Utils ----------
+def it_now():
+    # Solo orario Italia (UTC+2 “estivo” come da tua richiesta)
+    return datetime.utcnow() + timedelta(hours=2)
+
+def short_ts():
+    return it_now().strftime("%H:%M")
+
+def round2(x):
+    try:
+        return round(float(x), 2)
+    except:
+        return x
+
+def send(msg: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg},
+            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
             timeout=8
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print("Telegram error:", e)
 
-# --------------------------- DATI ----------------------------------
-def klines(sym):
+
+# ---------- Data ----------
+def get_klines(symbol: str, limit=LOOKBACK_BARS+VOL_AVG_BARS+5):
+    url = KLINE_URL.format(symbol=symbol, limit=limit)
     try:
-        r = requests.get(
-            KLINE_URL.format(s=sym),
-            headers={"User-Agent": "ok"},
-            timeout=12
-        )
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
-        return r.json()
-    except Exception:
+        data = r.json()
+        closes = [float(c[4]) for c in data]
+        base_vol = [float(c[5]) for c in data]  # quantità (coin)
+        # Convertiamo in USDT volume stimato: close * base_vol
+        usdt_vol = [closes[i] * base_vol[i] for i in range(len(closes))]
+        return closes, usdt_vol
+    except Exception as e:
+        print("MEXC error", symbol, e)
+        return None, None
+
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+# ---------- Analisi ----------
+def analyze(symbol: str):
+    closes, usdt_vol = get_klines(symbol)
+    if not closes or not usdt_vol or len(closes) < LOOKBACK_BARS + VOL_AVG_BARS + 2:
         return None
 
-def ema_series(x, p):
-    k = 2/(p+1)
-    out=[]; e=x[0]
-    for v in x:
-        e = v*k + e*(1-k)
-        out.append(e)
-    return out
+    price = closes[-1]
+    ema20 = ema(closes[-20:], 20)
+    ema60 = ema(closes[-60:], 60)
 
-def analyze(sym):
-    """
-    Ritorna:
-      price, open, vol15m, avg12h, setup ('LONG'/'SHORT'/None) basato su volumi + trend-safety,
-      e dati minimi per TP/SL
-    Nota: internamente uso EMA e candela per evitare falsi segnali,
-          ma nel report mostro SOLO i volumi come richiesto.
-    """
-    d = klines(sym)
-    if not d or len(d) < 60: 
-        return None
+    # vol 15m corrente e media
+    vol15  = usdt_vol[-1]
+    avg15  = sum(usdt_vol[-VOL_AVG_BARS:]) / VOL_AVG_BARS
+    ratio  = vol15 / avg15 if avg15 > 0 else 0.0
 
-    op=[float(c[1]) for c in d]
-    cl=[float(c[4]) for c in d]
-    q =[float(c[5]) for c in d]
-    usdt=[cl[i]*q[i] for i in range(len(cl))]
+    # livelli dinamici (escludo barra corrente)
+    dyn_high = max(closes[-(LOOKBACK_BARS+1):-1])
+    dyn_low  = min(closes[-(LOOKBACK_BARS+1):-1])
 
-    # Volumi
-    vol15 = usdt[-1]
-    avg12 = sum(usdt[-48:])/48  # media 12 ore
-    vol_ok = vol15 >= VOL_MULT * avg12
-
-    # Filtri di sicurezza (trend) per evitare falsi segnali
-    ema20 = ema_series(cl[-60:], 20)
-    ema60 = ema_series(cl[-60:], 60)
-    e20_now, e20_prev, e60_now = ema20[-1], ema20[-2], ema60[-1]
-    bull = cl[-1] > op[-1]
-    bear = cl[-1] < op[-1]
-
-    # Setup solo se i volumi sono forti; direzione confermata dai filtri minimi
-    setup = None
-    if vol_ok:
-        if e20_now > e60_now and e20_now > e20_prev and bull and cl[-1] >= e20_now:
-            setup = "LONG"
-        elif e20_now < e60_now and e20_now < e20_prev and bear and cl[-1] <= e20_now:
-            setup = "SHORT"
+    # trend con EMA
+    trend_up = ema20 is not None and ema60 is not None and ema20 > ema60
+    trend_dn = ema20 is not None and ema60 is not None and ema20 < ema60
 
     return {
-        "price": cl[-1],
+        "price": price,
+        "ema20": ema20,
+        "ema60": ema60,
         "vol15": vol15,
-        "avg12": avg12,
-        "setup": setup,
+        "avg15": avg15,
+        "ratio": ratio,
+        "dyn_high": dyn_high,
+        "dyn_low": dyn_low,
+        "trend_up": trend_up,
+        "trend_dn": trend_dn,
     }
 
-# ------------------------ TRADE MANAGEMENT -------------------------
-def open_trade(sym, side, entry):
-    if side == "LONG":
-        tp = entry*(1+TP_PCT/100); sl = entry*(1-SL_PCT/100)
+
+def strong_or_weak(ratio):
+    if ratio >= VOL_STRONG_X:
+        return "strong"
+    if ratio >= VOL_WEAK_X:
+        return "weak"
+    return "none"
+
+
+def check_breakouts(sym: str, a: dict):
+    """Ritorna un dict con eventuale segnale e tipo."""
+    if not a:
+        return None
+
+    p  = a["price"]
+    hi = a["dyn_high"]
+    lo = a["dyn_low"]
+    up = a["trend_up"]
+    dn = a["trend_dn"]
+    ratio = a["ratio"]
+
+    signal = None
+    # Breakout LONG sopra il massimo dinamico
+    if p >= hi * (1 + MIN_MOVE_PCT/100.0) and up:
+        kind = strong_or_weak(ratio)
+        if kind != "none":
+            signal = {"dir": "LONG", "kind": kind, "price": p}
+
+    # Breakdown SHORT sotto il minimo dinamico
+    if p <= lo * (1 - MIN_MOVE_PCT/100.0) and dn:
+        kind = strong_or_weak(ratio)
+        if kind != "none":
+            signal = {"dir": "SHORT", "kind": kind, "price": p}
+
+    return signal
+
+
+def format_report_line(sym: str, a: dict):
+    dot = "🟢" if a["ema20"] > a["ema60"] else "🔴" if a["ema20"] < a["ema60"] else "🟡"
+    # Volumi in M
+    v_now  = f"{a['vol15']/1e6:.1f}M"
+    v_avg  = f"{a['avg15']/1e6:.1f}M"
+    ratio  = f"{a['ratio']:.2f}x"
+    return (
+        f"{dot} <b>{sym}</b>: {round2(a['price'])}$ | "
+        f"EMA20:{round2(a['ema20'])} | EMA60:{round2(a['ema60'])} | "
+        f"Vol15m:{v_now} (avg:{v_avg} | {ratio})"
+    )
+
+
+def send_signal(sym: str, sig: dict, a: dict):
+    """Invia breakout debole o ENTRA forte con TP/SL."""
+    now_ts = time.time()
+    prev = last_signal[sym]
+
+    # Antispam: evita lo stesso segnale entro il cooldown
+    if prev["dir"] == sig["dir"] and (now_ts - prev["ts"] < SIGNAL_COOLDOWN_S):
+        return
+
+    last_signal[sym] = {"dir": sig["dir"], "ts": now_ts}
+
+    # Messaggi
+    if sig["kind"] == "weak":
+        label = "Breakout debole" if sig["dir"] == "LONG" else "Breakdown debole"
+        send(
+            f"⚠️ <b>{label} {sym}</b> | {round2(sig['price'])}$ | "
+            f"Vol15m {a['vol15']/1e6:.1f}M ({a['ratio']:.2f}x)"
+        )
     else:
-        tp = entry*(1-TP_PCT/100); sl = entry*(1+SL_PCT/100)
-    STATE[sym]["trade"] = {"side": side, "entry": entry, "tp": tp, "sl": sl}
-    tg(f"🔥 ENTRA {side} {sym}\nPrezzo: {entry:.2f}\nTarget: {tp:.2f}\nStop: {sl:.2f}")
+        # Forte => ENTRA + TP/SL
+        entry = sig["price"]
+        if sig["dir"] == "LONG":
+            tp = entry * (1 + TP_PCT/100.0)
+            sl = entry * (1 - SL_PCT/100.0)
+        else:
+            tp = entry * (1 - TP_PCT/100.0)
+            sl = entry * (1 + SL_PCT/100.0)
 
-def monitor(sym, price):
-    t = STATE[sym]["trade"]
-    if not t: return
-    if t["side"] == "LONG":
-        if price >= t["tp"]:
-            tg(f"✅ TP LONG {sym} a {t['tp']:.2f}"); STATE[sym]["trade"] = None
-        elif price <= t["sl"]:
-            tg(f"❌ STOP LONG {sym} a {t['sl']:.2f}"); STATE[sym]["trade"] = None
-    else:
-        if price <= t["tp"]:
-            tg(f"✅ TP SHORT {sym} a {t['tp']:.2f}"); STATE[sym]["trade"] = None
-        elif price >= t["sl"]:
-            tg(f"❌ STOP SHORT {sym} a {t['sl']:.2f}"); STATE[sym]["trade"] = None
+        send(
+            "🔥 <b>ENTRA {dir} {sym}</b>\n"
+            "Prezzo: {p}\nTarget: {tp}\nStop: {sl}".format(
+                dir=sig["dir"], sym=sym, p=round2(entry), tp=round2(tp), sl=round2(sl)
+            )
+        )
 
-# ------------------------ SIGNALI (ONLY STRONG) --------------------
-def maybe_signal(sym, a):
-    side = a["setup"]  # LONG/SHORT/None
-    if not side:
-        return
 
-    now = time.time()
-    # cooldown per evitare ripetizioni stesso lato
-    if STATE[sym]["dir"] == side and (now - STATE[sym]["cool_ts"]) < STRONG_COOLD:
-        return
+# ---------- MAIN ----------
+def main():
+    global STARTUP_SENT, last_report_ts
 
-    # anti-duplicato su contenuto
-    h = hashlib.sha1(f"{sym}|{side}|{a['price']:.2f}|{a['vol15']:.0f}".encode()).hexdigest()
-    if h == STATE[sym]["last_sig_hash"] and (now - STATE[sym]["cool_ts"]) < STRONG_COOLD:
-        return
+    if not STARTUP_SENT:
+        send("✅ Bot attivo – Segnali con <b>conferma volumi</b> (solo orario Italia)")
+        STARTUP_SENT = True
 
-    open_trade(sym, side, a["price"])
-    STATE[sym]["dir"] = side
-    STATE[sym]["cool_ts"] = now
-    STATE[sym]["last_sig_hash"] = h
+    while True:
+        try:
+            # REPORT ogni 30 minuti
+            now = time.time()
+            if now - last_report_ts >= REPORT_EVERY_SEC:
+                last_report_ts = now
 
-# --------------------------- REPORT --------------------------------
-def report_line(sym, a):
-    mul = (a["vol15"]/a["avg12"]) if a["avg12"]>0 else 0.0
-    setup = a["setup"] if a["setup"] else "nessuno"
-    return (f"{sym}: {a['price']:.2f}$ | Vol15m {a['vol15']/1e6:.1f}M "
-            f"vs avg {a['avg12']/1e6:.1f}M (x{mul:.2f}) | Setup: {setup}")
+                lines = []
+                analy = {}
 
-def build_report():
-    A = {s: analyze(s) for s in ["BTC", "ETH"]}
-    if not A["BTC"] or not A["ETH"]:
-        return None, None
-    it = now_it().strftime("%d/%m %H:%M")
-    text = f"🕒 Report {it} (Italia)\n\n{report_line('BTC',A['BTC'])}\n{report_line('ETH',A['ETH'])}"
-    return text, A
+                for s in SYMBOLS:
+                    a = analyze(s)
+                    analy[s] = a
+                    if a:
+                        lines.append(format_report_line(s, a))
+                    else:
+                        lines.append(f"🟡 <b>{s}</b>: dati non disponibili")
 
-def send_report_no_dup():
-    global LAST_REPORT_HASH, LAST_REPORT_TS
-    text, A = build_report()
-    if not text: 
-        return
-    h = hashlib.sha1(text.encode()).hexdigest()
-    now = time.time()
-    if h == LAST_REPORT_HASH and (now - LAST_REPORT_TS) < REPORT_MIN_GAP:
-        return
-    tg(text)
-    LAST_REPORT_HASH, LAST_REPORT_TS = h, now
-    # monitora TP/SL appena dopo
-    for s in ["BTC", "ETH"]:
-        monitor(s, A[s]["price"])
+                # Suggerimento semplice: se entrambi up -> LONG; entrambi dn -> SHORT; altrimenti neutro
+                def tflag(x): 
+                    return 1 if analy[x] and analy[x]["trend_up"] else (-1 if analy[x] and analy[x]["trend_dn"] else 0)
+                tsum = tflag("BTC") + tflag("ETH")
+                if tsum == 2:
+                    suggestion = "Suggerimento: Preferenza LONG ✅"
+                elif tsum == -2:
+                    suggestion = "Suggerimento: Preferenza SHORT ❌"
+                else:
+                    suggestion = "Suggerimento: Trend misto – Attendere conferma ⚠️"
 
-# -------------------------- SCHEDULER ------------------------------
-def next_half_hour_ts():
-    t = now_it().replace(second=0, microsecond=0)
-    add = 30 - (t.minute % 30)
-    if add == 0: add = 30
-    return (t + timedelta(minutes=add)).timestamp()
+                report = (
+                    f"🕒 Report {short_ts()} (Italia)\n\n" +
+                    "\n".join(lines) +
+                    f"\n\n{suggestion}"
+                )
+                send(report)
 
-# ----------------------------- MAIN --------------------------------
-if not STARTUP_SENT:
-    tg("✅ Bot attivo – Segnali con conferma volumi (solo Italia)")
-    STARTUP_SENT = True
+            # Segnali in tempo quasi-reale (loop leggero)
+            for s in SYMBOLS:
+                a = analyze(s)
+                if not a:
+                    continue
+                sig = check_breakouts(s, a)
+                if sig:
+                    send_signal(s, sig, a)
 
-next_report = next_half_hour_ts()
+            time.sleep(30)  # frequenza controllo segnale
 
-while True:
-    try:
-        for s in ["BTC", "ETH"]:
-            a = analyze(s)
-            if not a: 
-                continue
-            maybe_signal(s, a)
-            monitor(s, a["price"])
+        except Exception as e:
+            print("Loop error:", e)
+            time.sleep(5)
 
-        if time.time() >= next_report:
-            send_report_no_dup()
-            next_report = next_half_hour_ts()
 
-        time.sleep(POLL_SLEEP)
-
-    except Exception:
-        # evita crash per errori temporanei (rete/API)
-        time.sleep(10)
+if __name__ == "__main__":
+    main()

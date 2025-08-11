@@ -1,286 +1,329 @@
-# main_ultimate_alert_v2.py
-# Bot BTC/ETH – breakout dinamici + volumi 15m con rapporto, TP/SL dinamici
-# Report ogni 30 minuti (solo orario Italia). Segnali Apple-Watch friendly.
-
 import time
-import math
 import requests
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # per gestire fusi orari
 
-# =============== CONFIG =================
+# === AGGIUNTE per grafico ===
+import io
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+# ============================
 
-TOKEN   = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
-CHAT_ID = "-1002181919588"
+# --- CONFIGURAZIONE ---
+TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
+CHAT_ID = "-1002181919588"  # ID gruppo Bot_BTC_ETH_Famiglia
 
-# Opzionale (oggi non obbligatorio). Lasciare "" se non usi conferma CMC.
-CMC_API_KEY = ""   # es. "e1bf46bf-...."  (se vuoto: ignorato)
+LEVELS = {
+    "BTC": {"breakout": [117700, 118300], "breakdown": [116800, 116300]},
+    "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
+}
 
-# Prezzi/volumi 15m da MEXC
-KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit={limit}"
+VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT
+MIN_MOVE_PCT = 0.2  # % minima superamento livello
+TP_PCT = 1.0        # Target +1%
+SL_PCT = 0.3        # Stop -0.3%
 
-SYMBOLS = ["BTC", "ETH"]
+KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
 
-# Livelli dinamici (massimo/minimo lookback) e sensibilità breakout
-LOOKBACK_BARS   = 96           # ~24 ore su 15m
-MIN_MOVE_PCT    = 0.15         # % minima oltre il livello dinamico per contare come breakout
-
-# Volumi: soglia forza / rapporto vol/avg
-VOL_AVG_BARS    = 32           # media 15m per confronto
-VOL_STRONG_X    = 1.30         # >= 1.30x media => forte
-VOL_WEAK_X      = 1.05         # 1.05–1.30x => debole (se <1.05x non segnaliamo)
-
-# TP/SL dinamici
-TP_PCT = 0.80                   # 0.80% target
-SL_PCT = 0.35                   # 0.35% stop
-
-# Report & antispam
-REPORT_EVERY_SEC   = 30 * 60    # ogni 30 minuti
-SIGNAL_COOLDOWN_S  = 10 * 60    # non ripetere lo stesso segnale per 10 minuti
-
-# =======================================
+# Stato segnali
+last_signal = {"BTC": None, "ETH": None}
+active_trade = {"BTC": None, "ETH": None}  # Salva target e stop
 
 
-# Stato in memoria
-last_report_ts = 0
-last_signal = {s: {"dir": None, "ts": 0} for s in SYMBOLS}
-
-# Banner avvio una sola volta
-STARTUP_SENT = False
-
-
-# ---------- Utils ----------
-def it_now():
-    # Solo orario Italia (UTC+2 “estivo” come da tua richiesta)
-    return datetime.utcnow() + timedelta(hours=2)
-
-def short_ts():
-    return it_now().strftime("%H:%M")
-
-def round2(x):
+# --- FUNZIONI BASE ---
+def send_telegram_message(message: str):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        return round(float(x), 2)
-    except:
-        return x
+        requests.post(url, data=payload, timeout=5)
+    except Exception as e:
+        print(f"Errore invio Telegram: {e}")
 
-def send(msg: str):
+
+def get_klines(symbol: str):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = KLINE_URL.format(symbol=symbol)
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        return resp.json()
+    except Exception as e:
+        print(f"Errore klines {symbol}: {e}")
+        return None
+
+
+def calc_ema(prices, period):
+    k = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+
+# === FUNZIONI NUOVE: grafico + notifica ottimizzata ===
+def build_chart_for(symbol, entry, tp, sl):
+    """Crea grafico 15m con MACD & KDJ e restituisce BytesIO pronto per Telegram."""
+    data = get_klines(symbol)
+    if not data:
+        raise RuntimeError("Dati klines non disponibili")
+
+    closes = [float(c[4]) for c in data]
+    highs  = [float(c[2]) for c in data]
+    lows   = [float(c[3]) for c in data]
+    times  = [datetime.fromtimestamp(c[0]/1000) for c in data]
+
+    df = pd.DataFrame({"time": times, "close": closes, "high": highs, "low": lows})
+
+    # MACD (12,26,9)
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
+
+    # KDJ (9,3,3)
+    low_min = df["low"].rolling(window=9).min()
+    high_max = df["high"].rolling(window=9).max()
+    rsv = (df["close"] - low_min) / (high_max - low_min) * 100
+    df["K"] = rsv.ewm(com=2).mean()
+    df["D"] = df["K"].ewm(com=2).mean()
+    df["J"] = 3*df["K"] - 2*df["D"]
+
+    # Grafico (prezzo + MACD + KDJ)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11,8), sharex=True,
+                                        gridspec_kw={'height_ratios':[3,1,1]})
+    ax1.plot(df["time"], df["close"], label=f"{symbol}/USDT")
+    ax1.axhline(entry, linestyle="--", label="Entrata")
+    ax1.axhline(tp,    linestyle="--", label="Target")
+    ax1.axhline(sl,    linestyle="--", label="Stop")
+    ax1.legend(); ax1.grid(True); ax1.set_ylabel("USDT")
+
+    ax2.plot(df["time"], df["MACD"], label="MACD")
+    ax2.plot(df["time"], df["MACD_SIGNAL"], label="Signal")
+    ax2.bar(df["time"], df["MACD_HIST"], label="Hist")
+    ax2.legend(); ax2.grid(True)
+
+    ax3.plot(df["time"], df["K"], label="K")
+    ax3.plot(df["time"], df["D"], label="D")
+    ax3.plot(df["time"], df["J"], label="J")
+    ax3.legend(); ax3.grid(True)
+
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+    plt.xticks(rotation=45); plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    plt.close(fig); buf.seek(0)
+    return buf
+
+
+def notify_signal(symbol, direction, entry, tp, sl):
+    """
+    Notifica ottimizzata per lock screen / Apple Watch:
+    - PRIMA RIGA chiarissima: LONG/SHORT + simbolo + TF + prezzo.
+    - Poi dettagli.
+    - E invio grafico 15m con MACD/KDJ.
+    """
+    # Titolo super breve (quello che leggi sulla notifica)
+    title = f"🚨 {direction} {symbol} 15m | Ingresso {round(entry,2)}"
     try:
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=8
+            data={"chat_id": CHAT_ID, "text": title}, timeout=5
         )
     except Exception as e:
-        print("Telegram error:", e)
+        print("Errore invio titolo notifica:", e)
 
-
-# ---------- Data ----------
-def get_klines(symbol: str, limit=LOOKBACK_BARS+VOL_AVG_BARS+5):
-    url = KLINE_URL.format(symbol=symbol, limit=limit)
+    # Corpo (subito dopo, nella stessa chat)
+    body = (
+        f"🎯 Target: {round(tp,2)}   🛑 Stop: {round(sl,2)}\n"
+        f"⏱️ TF: 15m   📊 Vol: auto\n"
+        f"Entra solo se sei operativo."
+    )
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        closes = [float(c[4]) for c in data]
-        base_vol = [float(c[5]) for c in data]  # quantità (coin)
-        # Convertiamo in USDT volume stimato: close * base_vol
-        usdt_vol = [closes[i] * base_vol[i] for i in range(len(closes))]
-        return closes, usdt_vol
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": body}, timeout=5
+        )
     except Exception as e:
-        print("MEXC error", symbol, e)
-        return None, None
+        print("Errore invio corpo notifica:", e)
+
+    # Grafico
+    try:
+        chart = build_chart_for(symbol, entry, tp, sl)
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+            data={"chat_id": CHAT_ID, "caption": "📸 Grafico 15m con MACD & KDJ"},
+            files={"photo": ("chart.png", chart.getvalue())},
+            timeout=15
+        )
+    except Exception as e:
+        print("Errore invio grafico:", e)
+# === FINE FUNZIONI NUOVE ===
 
 
-def ema(values, period):
-    if len(values) < period:
+# --- ANALISI DATI ---
+def analyze(symbol):
+    data = get_klines(symbol)
+    if not data:
+        send_telegram_message(f"⚠️ Errore dati {symbol}")
         return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
 
+    closes = [float(c[4]) for c in data]
+    base_volumes = [float(c[5]) for c in data]
+    usdt_volumes = [closes[i] * base_volumes[i] for i in range(len(closes))]
 
-# ---------- Analisi ----------
-def analyze(symbol: str):
-    closes, usdt_vol = get_klines(symbol)
-    if not closes or not usdt_vol or len(closes) < LOOKBACK_BARS + VOL_AVG_BARS + 2:
-        return None
-
-    price = closes[-1]
-    ema20 = ema(closes[-20:], 20)
-    ema60 = ema(closes[-60:], 60)
-
-    # vol 15m corrente e media
-    vol15  = usdt_vol[-1]
-    avg15  = sum(usdt_vol[-VOL_AVG_BARS:]) / VOL_AVG_BARS
-    ratio  = vol15 / avg15 if avg15 > 0 else 0.0
-
-    # livelli dinamici (escludo barra corrente)
-    dyn_high = max(closes[-(LOOKBACK_BARS+1):-1])
-    dyn_low  = min(closes[-(LOOKBACK_BARS+1):-1])
-
-    # trend con EMA
-    trend_up = ema20 is not None and ema60 is not None and ema20 > ema60
-    trend_dn = ema20 is not None and ema60 is not None and ema20 < ema60
+    last_close = closes[-1]
+    last_volume = usdt_volumes[-1]
+    ema20 = calc_ema(closes[-20:], 20)
+    ema60 = calc_ema(closes[-60:], 60)
 
     return {
-        "price": price,
+        "price": last_close,
+        "volume": last_volume,
         "ema20": ema20,
-        "ema60": ema60,
-        "vol15": vol15,
-        "avg15": avg15,
-        "ratio": ratio,
-        "dyn_high": dyn_high,
-        "dyn_low": dyn_low,
-        "trend_up": trend_up,
-        "trend_dn": trend_dn,
+        "ema60": ema60
     }
 
 
-def strong_or_weak(ratio):
-    if ratio >= VOL_STRONG_X:
-        return "strong"
-    if ratio >= VOL_WEAK_X:
-        return "weak"
-    return "none"
+# --- SEGNALI E TRADE ---
+def open_trade(symbol, direction, entry_price):
+    """Imposta target e stop dinamici"""
+    if direction == "LONG":
+        tp = entry_price * (1 + TP_PCT / 100)
+        sl = entry_price * (1 - SL_PCT / 100)
+    else:
+        tp = entry_price * (1 - TP_PCT / 100)
+        sl = entry_price * (1 + SL_PCT / 100)
+
+    active_trade[symbol] = {
+        "direction": direction,
+        "entry": entry_price,
+        "tp": tp,
+        "sl": sl
+    }
+
+    # ======= NUOVA NOTIFICA + GRAFICO (LONG/SHORT) =======
+    # Prima riga chiarissima in notifica + dettagli + grafico 15m
+    notify_signal(symbol, direction, entry_price, tp, sl)
+    # =====================================================
 
 
-def check_breakouts(sym: str, a: dict):
-    """Ritorna un dict con eventuale segnale e tipo."""
-    if not a:
-        return None
-
-    p  = a["price"]
-    hi = a["dyn_high"]
-    lo = a["dyn_low"]
-    up = a["trend_up"]
-    dn = a["trend_dn"]
-    ratio = a["ratio"]
-
-    signal = None
-    # Breakout LONG sopra il massimo dinamico
-    if p >= hi * (1 + MIN_MOVE_PCT/100.0) and up:
-        kind = strong_or_weak(ratio)
-        if kind != "none":
-            signal = {"dir": "LONG", "kind": kind, "price": p}
-
-    # Breakdown SHORT sotto il minimo dinamico
-    if p <= lo * (1 - MIN_MOVE_PCT/100.0) and dn:
-        kind = strong_or_weak(ratio)
-        if kind != "none":
-            signal = {"dir": "SHORT", "kind": kind, "price": p}
-
-    return signal
-
-
-def format_report_line(sym: str, a: dict):
-    dot = "🟢" if a["ema20"] > a["ema60"] else "🔴" if a["ema20"] < a["ema60"] else "🟡"
-    # Volumi in M
-    v_now  = f"{a['vol15']/1e6:.1f}M"
-    v_avg  = f"{a['avg15']/1e6:.1f}M"
-    ratio  = f"{a['ratio']:.2f}x"
-    return (
-        f"{dot} <b>{sym}</b>: {round2(a['price'])}$ | "
-        f"EMA20:{round2(a['ema20'])} | EMA60:{round2(a['ema60'])} | "
-        f"Vol15m:{v_now} (avg:{v_avg} | {ratio})"
-    )
-
-
-def send_signal(sym: str, sig: dict, a: dict):
-    """Invia breakout debole o ENTRA forte con TP/SL."""
-    now_ts = time.time()
-    prev = last_signal[sym]
-
-    # Antispam: evita lo stesso segnale entro il cooldown
-    if prev["dir"] == sig["dir"] and (now_ts - prev["ts"] < SIGNAL_COOLDOWN_S):
+def monitor_trade(symbol, price):
+    """Controlla se target o stop vengono colpiti"""
+    trade = active_trade[symbol]
+    if not trade:
         return
 
-    last_signal[sym] = {"dir": sig["dir"], "ts": now_ts}
+    direction = trade["direction"]
+    tp = trade["tp"]
+    sl = trade["sl"]
 
-    # Messaggi
-    if sig["kind"] == "weak":
-        label = "Breakout debole" if sig["dir"] == "LONG" else "Breakdown debole"
-        send(
-            f"⚠️ <b>{label} {sym}</b> | {round2(sig['price'])}$ | "
-            f"Vol15m {a['vol15']/1e6:.1f}M ({a['ratio']:.2f}x)"
-        )
+    # LONG
+    if direction == "LONG":
+        if price >= tp:
+            send_telegram_message(f"✅ TP raggiunto LONG {symbol} a {round(tp,2)}")
+            active_trade[symbol] = None
+        elif price <= sl:
+            send_telegram_message(f"❌ STOP colpito LONG {symbol} a {round(sl,2)}")
+            active_trade[symbol] = None
+
+    # SHORT
+    if direction == "SHORT":
+        if price <= tp:
+            send_telegram_message(f"✅ TP raggiunto SHORT {symbol} a {round(tp,2)}")
+            active_trade[symbol] = None
+        elif price >= sl:
+            send_telegram_message(f"❌ STOP colpito SHORT {symbol} a {round(sl,2)}")
+            active_trade[symbol] = None
+
+
+def check_signal(symbol, analysis, levels):
+    global last_signal
+    price = analysis["price"]
+    volume = analysis["volume"]
+    ema20 = analysis["ema20"]
+    ema60 = analysis["ema60"]
+
+    vol_thresh = VOLUME_THRESHOLDS[symbol]
+
+    def valid_break(level, current_price):
+        return abs((current_price - level) / level * 100) > MIN_MOVE_PCT
+
+    # Breakout LONG
+    for level in levels["breakout"]:
+        if price >= level and ema20 > ema60 and valid_break(level, price):
+            if volume > vol_thresh and last_signal[symbol] != "LONG":
+                open_trade(symbol, "LONG", price)
+                last_signal[symbol] = "LONG"
+            elif volume <= vol_thresh:
+                send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
+
+    # Breakdown SHORT
+    for level in levels["breakdown"]:
+        if price <= level and ema20 < ema60 and valid_break(level, price):
+            if volume > vol_thresh and last_signal[symbol] != "SHORT":
+                open_trade(symbol, "SHORT", price)
+                last_signal[symbol] = "SHORT"
+            elif volume <= vol_thresh:
+                send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
+
+    # Reset segnale se neutro
+    if levels["breakdown"][-1] < price < levels["breakout"][0]:
+        last_signal[symbol] = None
+
+
+# --- REPORT TREND ---
+def format_report_line(symbol, price, ema20, ema60, volume):
+    trend = "🟢" if ema20 > ema60 else "🔴" if ema20 < ema60 else "⚪"
+    return f"{trend} {symbol}: {round(price,2)}$ | EMA20:{round(ema20,2)} | EMA60:{round(ema60,2)} | Vol:{round(volume/1e6,1)}M"
+
+
+def build_suggestion(btc_trend, eth_trend):
+    if btc_trend == "🟢" and eth_trend == "🟢":
+        return "Suggerimento: Preferenza LONG ✅"
+    elif btc_trend == "🔴" and eth_trend == "🔴":
+        return "Suggerimento: Preferenza SHORT ❌"
     else:
-        # Forte => ENTRA + TP/SL
-        entry = sig["price"]
-        if sig["dir"] == "LONG":
-            tp = entry * (1 + TP_PCT/100.0)
-            sl = entry * (1 - SL_PCT/100.0)
-        else:
-            tp = entry * (1 - TP_PCT/100.0)
-            sl = entry * (1 + SL_PCT/100.0)
-
-        send(
-            "🔥 <b>ENTRA {dir} {sym}</b>\n"
-            "Prezzo: {p}\nTarget: {tp}\nStop: {sl}".format(
-                dir=sig["dir"], sym=sym, p=round2(entry), tp=round2(tp), sl=round2(sl)
-            )
-        )
+        return "Suggerimento: Trend misto – Attendere conferma ⚠️"
 
 
-# ---------- MAIN ----------
-def main():
-    global STARTUP_SENT, last_report_ts
-
-    if not STARTUP_SENT:
-        send("✅ Bot attivo – Segnali con <b>conferma volumi</b> (solo orario Italia)")
-        STARTUP_SENT = True
+# --- MAIN LOOP ---
+if __name__ == "__main__":
+    send_telegram_message("✅ Bot PRO attivo – Segnali Fortissimi con TP/SL dinamici (Apple Watch ready)")
 
     while True:
-        try:
-            # REPORT ogni 30 minuti
-            now = time.time()
-            if now - last_report_ts >= REPORT_EVERY_SEC:
-                last_report_ts = now
+        now_it = datetime.now(tz=ZoneInfo("Europe/Rome")).strftime("%H:%M")
+        now_utc = datetime.now(tz=ZoneInfo("UTC")).strftime("%H:%M")
+        report_msg = f"🕒 Report {now_it} (Italia) | {now_utc} UTC\n"
 
-                lines = []
-                analy = {}
+        trends = {}
 
-                for s in SYMBOLS:
-                    a = analyze(s)
-                    analy[s] = a
-                    if a:
-                        lines.append(format_report_line(s, a))
-                    else:
-                        lines.append(f"🟡 <b>{s}</b>: dati non disponibili")
+        for symbol in ["BTC", "ETH"]:
+            analysis = analyze(symbol)
+            if analysis:
+                price = analysis["price"]
+                volume = analysis["volume"]
+                ema20 = analysis["ema20"]
+                ema60 = analysis["ema60"]
 
-                # Suggerimento semplice: se entrambi up -> LONG; entrambi dn -> SHORT; altrimenti neutro
-                def tflag(x): 
-                    return 1 if analy[x] and analy[x]["trend_up"] else (-1 if analy[x] and analy[x]["trend_dn"] else 0)
-                tsum = tflag("BTC") + tflag("ETH")
-                if tsum == 2:
-                    suggestion = "Suggerimento: Preferenza LONG ✅"
-                elif tsum == -2:
-                    suggestion = "Suggerimento: Preferenza SHORT ❌"
-                else:
-                    suggestion = "Suggerimento: Trend misto – Attendere conferma ⚠️"
+                # Controlla segnali
+                check_signal(symbol, analysis, LEVELS[symbol])
 
-                report = (
-                    f"🕒 Report {short_ts()} (Italia)\n\n" +
-                    "\n".join(lines) +
-                    f"\n\n{suggestion}"
-                )
-                send(report)
+                # Monitora eventuale trade aperto
+                monitor_trade(symbol, price)
 
-            # Segnali in tempo quasi-reale (loop leggero)
-            for s in SYMBOLS:
-                a = analyze(s)
-                if not a:
-                    continue
-                sig = check_breakouts(s, a)
-                if sig:
-                    send_signal(s, sig, a)
+                # Aggiungi trend
+                trend_emoji = "🟢" if ema20 > ema60 else "🔴" if ema20 < ema60 else "⚪"
+                trends[symbol] = trend_emoji
 
-            time.sleep(30)  # frequenza controllo segnale
+                report_msg += f"\n{format_report_line(symbol, price, ema20, ema60, volume)}"
+            else:
+                report_msg += f"\n{symbol}: Errore dati"
+                trends[symbol] = "⚪"
 
-        except Exception as e:
-            print("Loop error:", e)
-            time.sleep(5)
+        # Aggiungi suggerimento operativo
+        report_msg += f"\n\n{build_suggestion(trends['BTC'], trends['ETH'])}"
 
-
-if __name__ == "__main__":
-    main()
+        send_telegram_message(report_msg)
+        time.sleep(1800)  # Report ogni 30 min

@@ -3,13 +3,12 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo  # per gestire fusi orari
 
-# === AGGIUNTE per grafico ===
+# === LIBRERIE PER GRAFICI ===
 import io
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
 import numpy as np
-# ============================
 
 # --- CONFIGURAZIONE ---
 TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
@@ -17,22 +16,29 @@ CHAT_ID = "-1002181919588"  # ID gruppo Bot_BTC_ETH_Famiglia
 
 LEVELS = {
     "BTC": {"breakout": [117700, 118300], "breakdown": [116800, 116300]},
-    "ETH": {"breakout": [3190, 3250], "breakdown": [3120, 3070]}
+    "ETH": {"breakout": [3190, 3250],    "breakdown": [3120, 3070]}
 }
 
-VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT
-MIN_MOVE_PCT = 0.2  # % minima superamento livello
-TP_PCT = 1.0        # Target +1%
-SL_PCT = 0.3        # Stop -0.3%
+VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT nominali
+MIN_MOVE_PCT = 0.2   # % minima di superamento livello (residuo della tua logica)
+# --- Nuovi parametri robustezza ---
+BUFFER_PCT      = 0.0005  # 0.05%: chiusura oltre livello per conferma
+RETEST_TOL_PCT  = 0.0002  # 0.02%: tolleranza di retest sul livello
+ATR_PERIOD      = 14
+ATR_SL_MULT     = 1.2
+ATR_TP_MULT     = 2.0
+MIN_RR          = 1.5     # R/R minimo
+BE_TRIGGER_PCT  = 0.004   # +0.4% a favore
+BE_WINDOW_CAND  = 2       # entro 2 candele da apertura
 
-KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=60"
+KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=120"
 
 # Stato segnali
-last_signal = {"BTC": None, "ETH": None}
-active_trade = {"BTC": None, "ETH": None}  # Salva target e stop
+last_signal  = {"BTC": None, "ETH": None}
+active_trade = {"BTC": None, "ETH": None}  # Salva target e stop e metadata
 
 
-# --- FUNZIONI BASE ---
+# --- UTILITY TELEGRAM ---
 def send_telegram_message(message: str):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
@@ -46,7 +52,7 @@ def get_klines(symbol: str):
     headers = {"User-Agent": "Mozilla/5.0"}
     url = KLINE_URL.format(symbol=symbol)
     try:
-        resp = requests.get(url, headers=headers, timeout=5)
+        resp = requests.get(url, headers=headers, timeout=7)
         return resp.json()
     except Exception as e:
         print(f"Errore klines {symbol}: {e}")
@@ -61,28 +67,39 @@ def calc_ema(prices, period):
     return ema
 
 
-# === FUNZIONI NUOVE: grafico + notifica ottimizzata ===
-def build_chart_for(symbol, entry, tp, sl):
-    """Crea grafico 15m con MACD & KDJ (linee ben differenziate) e ritorna BytesIO pronto per Telegram."""
+def build_df(symbol):
+    """Restituisce DataFrame 15m con OHLCV e indicatori base + ATR."""
     data = get_klines(symbol)
     if not data:
-        raise RuntimeError("Dati klines non disponibili")
+        return None
+    cols = ["open_time","open","high","low","close","volume",
+            "close_time","qvol","trades","tb_base","tb_quote","ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    df["open"]  = df["open"].astype(float)
+    df["high"]  = df["high"].astype(float)
+    df["low"]   = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["volume"]= df["volume"].astype(float)
+    df["open_time"]  = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
 
-    closes = [float(c[4]) for c in data]
-    highs  = [float(c[2]) for c in data]
-    lows   = [float(c[3]) for c in data]
-    times  = [datetime.fromtimestamp(c[0]/1000) for c in data]
+    # ATR
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        (df["high"] - df["low"]).abs(),
+        (df["high"] - prev_close).abs(),
+        (df["low"]  - prev_close).abs()
+    ], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(ATR_PERIOD).mean()
 
-    df = pd.DataFrame({"time": times, "close": closes, "high": highs, "low": lows})
-
-    # --- MACD (12,26,9)
+    # MACD
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    # --- KDJ (9,3,3)
+    # KDJ
     low_min = df["low"].rolling(window=9).min()
     high_max = df["high"].rolling(window=9).max()
     rsv = (df["close"] - low_min) / (high_max - low_min) * 100
@@ -90,42 +107,49 @@ def build_chart_for(symbol, entry, tp, sl):
     df["D"] = df["K"].ewm(com=2).mean()
     df["J"] = 3*df["K"] - 2*df["D"]
 
-    # --- Figura
+    return df
+
+
+# === GRAFICO + NOTIFICA ottimizzata ===
+def build_chart_for(symbol, entry, tp, sl):
+    df = build_df(symbol)
+    if df is None:
+        raise RuntimeError("Dati klines non disponibili")
+
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11,8), sharex=True,
                                         gridspec_kw={'height_ratios':[3,1,1]})
-
     # Prezzo
-    ax1.plot(df["time"], df["close"], label=f"{symbol}/USDT")
+    ax1.plot(df["close_time"], df["close"], label=f"{symbol}/USDT")
     ax1.grid(True, linewidth=0.4)
 
     # Linee ben differenziate
-    ax1.axhline(entry, color="#16a34a", linestyle="--", linewidth=2.2, label="Entrata")      # verde
-    ax1.axhline(tp,    color="#f59e0b", linestyle=(0,(9,4)), linewidth=2.2, label="Target")  # arancione dash lungo
-    ax1.axhline(sl,    color="#ef4444", linestyle=(0,(3,3)), linewidth=2.2, label="Stop")    # rosso dash corto
+    ax1.axhline(entry, color="#16a34a", linestyle="--",      linewidth=2.2, label="Entrata")  # verde
+    ax1.axhline(tp,    color="#f59e0b", linestyle=(0,(9,4)), linewidth=2.2, label="Target")   # arancione
+    ax1.axhline(sl,    color="#ef4444", linestyle=(0,(3,3)), linewidth=2.2, label="Stop")     # rosso
 
-    # Etichette valori sul bordo destro
+    # Etichette
     def annotate_hline(y, text, color):
-        ax1.text(df["time"].iloc[-1], y, f"  {text}", color=color,
+        ax1.text(df["close_time"].iloc[-1], y, f"  {text}", color=color,
                  va="center", fontsize=10, bbox=dict(facecolor="white", alpha=0.7, edgecolor=color))
     annotate_hline(entry, f"Entrata {round(entry,2)}", "#16a34a")
-    annotate_hline(tp,    f"Target {round(tp,2)}",   "#f59e0b")
-    annotate_hline(sl,    f"Stop {round(sl,2)}",     "#ef4444")
+    annotate_hline(tp,    f"Target {round(tp,2)}",     "#f59e0b")
+    annotate_hline(sl,    f"Stop {round(sl,2)}",       "#ef4444")
 
     ax1.set_ylabel("USDT")
     ax1.legend(loc="upper left")
 
-    # MACD con hist verde/rosso
+    # MACD istogramma verde/rosso
     colors = np.where(df["MACD_HIST"]>=0, "#16a34a", "#ef4444")
-    ax2.bar(df["time"], df["MACD_HIST"], color=colors, label="Hist")
-    ax2.plot(df["time"], df["MACD"], label="MACD")
-    ax2.plot(df["time"], df["MACD_SIGNAL"], label="Signal")
+    ax2.bar(df["close_time"], df["MACD_HIST"], color=colors, label="Hist")
+    ax2.plot(df["close_time"], df["MACD"], label="MACD")
+    ax2.plot(df["close_time"], df["MACD_SIGNAL"], label="Signal")
     ax2.grid(True, linewidth=0.4)
     ax2.legend(loc="upper left")
 
     # KDJ
-    ax3.plot(df["time"], df["K"], label="K")
-    ax3.plot(df["time"], df["D"], label="D")
-    ax3.plot(df["time"], df["J"], label="J")
+    ax3.plot(df["close_time"], df["K"], label="K")
+    ax3.plot(df["close_time"], df["D"], label="D")
+    ax3.plot(df["close_time"], df["J"], label="J")
     ax3.grid(True, linewidth=0.4)
     ax3.legend(loc="upper left")
 
@@ -140,12 +164,6 @@ def build_chart_for(symbol, entry, tp, sl):
 
 
 def notify_signal(symbol, direction, entry, tp, sl):
-    """
-    Notifica ottimizzata per lock screen / Apple Watch:
-    - Prima riga chiarissima: LONG/SHORT + simbolo + 15m + prezzo.
-    - Subito dopo dettagli compatti.
-    - Foto con grafico 15m (prezzo + Entrata/Target/Stop + MACD/KDJ).
-    """
     title = f"🚨 {direction} {symbol} 15m | Ingresso {round(entry,2)}"
     try:
         requests.post(
@@ -178,57 +196,68 @@ def notify_signal(symbol, direction, entry, tp, sl):
         )
     except Exception as e:
         print("Errore invio grafico:", e)
-# === FINE FUNZIONI NUOVE ===
 
 
-# --- ANALISI DATI ---
+# --- ANALISI DATI BASE (per report) ---
 def analyze(symbol):
-    data = get_klines(symbol)
-    if not data:
+    df = build_df(symbol)
+    if df is None:
         send_telegram_message(f"⚠️ Errore dati {symbol}")
         return None
 
-    closes = [float(c[4]) for c in data]
-    base_volumes = [float(c[5]) for c in data]
+    closes = df["close"].tolist()
+    base_volumes = df["volume"].tolist()
     usdt_volumes = [closes[i] * base_volumes[i] for i in range(len(closes))]
 
     last_close = closes[-1]
     last_volume = usdt_volumes[-1]
     ema20 = calc_ema(closes[-20:], 20)
     ema60 = calc_ema(closes[-60:], 60)
+    atr14 = df["ATR"].iloc[-1]
 
     return {
         "price": last_close,
         "volume": last_volume,
         "ema20": ema20,
-        "ema60": ema60
+        "ema60": ema60,
+        "atr":  atr14
     }
 
 
-# --- SEGNALI E TRADE ---
-def open_trade(symbol, direction, entry_price):
-    """Imposta target e stop dinamici"""
+# --- TRADE MANAGEMENT ---
+def open_trade(symbol, direction, entry_price, atr):
+    """ATR-based TP/SL + R/R minimo + metadata per break-even."""
+    # Calcolo SL/TP dinamici con ATR
     if direction == "LONG":
-        tp = entry_price * (1 + TP_PCT / 100)
-        sl = entry_price * (1 - SL_PCT / 100)
+        sl = entry_price - ATR_SL_MULT * atr
+        tp = entry_price + ATR_TP_MULT * atr
+        risk = entry_price - sl
+        reward = tp - entry_price
     else:
-        tp = entry_price * (1 - TP_PCT / 100)
-        sl = entry_price * (1 + SL_PCT / 100)
+        sl = entry_price + ATR_SL_MULT * atr
+        tp = entry_price - ATR_TP_MULT * atr
+        risk = sl - entry_price
+        reward = entry_price - tp
+
+    rr = reward / max(risk, 1e-9)
+    if rr < MIN_RR:
+        send_telegram_message(f"⏭️ {symbol} {direction}: R/R {rr:.2f} < {MIN_RR}, segnale saltato")
+        return
 
     active_trade[symbol] = {
         "direction": direction,
         "entry": entry_price,
         "tp": tp,
-        "sl": sl
+        "sl": sl,
+        "opened_at": datetime.now(tz=ZoneInfo("UTC")),  # per BE
+        "moved_to_be": False
     }
 
-    # ======= NOTIFICA + GRAFICO (LONG/SHORT) =======
     notify_signal(symbol, direction, entry_price, tp, sl)
-    # ===============================================
 
 
 def monitor_trade(symbol, price):
-    """Controlla se target o stop vengono colpiti"""
+    """Target/Stop + Break-even (+0,4% entro 2 candele)."""
     trade = active_trade[symbol]
     if not trade:
         return
@@ -236,52 +265,89 @@ def monitor_trade(symbol, price):
     direction = trade["direction"]
     tp = trade["tp"]
     sl = trade["sl"]
+    entry = trade["entry"]
 
-    # LONG
+    # Break-even window
+    if not trade["moved_to_be"]:
+        elapsed = datetime.now(tz=ZoneInfo("UTC")) - trade["opened_at"]
+        within_window = elapsed <= timedelta(minutes=15*BE_WINDOW_CAND)
+        if direction == "LONG" and within_window and price >= entry * (1 + BE_TRIGGER_PCT):
+            trade["sl"] = entry
+            trade["moved_to_be"] = True
+            send_telegram_message(f"🛡️ BE attivato LONG {symbol}: SL spostato a {round(entry,2)}")
+        if direction == "SHORT" and within_window and price <= entry * (1 - BE_TRIGGER_PCT):
+            trade["sl"] = entry
+            trade["moved_to_be"] = True
+            send_telegram_message(f"🛡️ BE attivato SHORT {symbol}: SL spostato a {round(entry,2)}")
+
+    # Gestione esiti
     if direction == "LONG":
         if price >= tp:
             send_telegram_message(f"✅ TP raggiunto LONG {symbol} a {round(tp,2)}")
             active_trade[symbol] = None
-        elif price <= sl:
-            send_telegram_message(f"❌ STOP colpito LONG {symbol} a {round(sl,2)}")
+        elif price <= trade["sl"]:
+            send_telegram_message(f"❌ STOP colpito LONG {symbol} a {round(trade['sl'],2)}")
             active_trade[symbol] = None
-
-    # SHORT
-    if direction == "SHORT":
+    else:
         if price <= tp:
             send_telegram_message(f"✅ TP raggiunto SHORT {symbol} a {round(tp,2)}")
             active_trade[symbol] = None
-        elif price >= sl:
-            send_telegram_message(f"❌ STOP colpito SHORT {symbol} a {round(sl,2)}")
+        elif price >= trade["sl"]:
+            send_telegram_message(f"❌ STOP colpito SHORT {symbol} a {round(trade['sl'],2)}")
             active_trade[symbol] = None
 
 
 def check_signal(symbol, analysis, levels):
+    """Conferma a chiusura con BUFFER + logica retest. Usa ATR in open_trade."""
     global last_signal
+    df = build_df(symbol)
+    if df is None:
+        return
+
     price = analysis["price"]
     volume = analysis["volume"]
     ema20 = analysis["ema20"]
     ema60 = analysis["ema60"]
-
+    atr14 = analysis["atr"]
     vol_thresh = VOLUME_THRESHOLDS[symbol]
 
     def valid_break(level, current_price):
         return abs((current_price - level) / level * 100) > MIN_MOVE_PCT
 
-    # Breakout LONG
+    last = df.iloc[-1]           # ultima candela CHIUSA
+    prev = df.iloc[-2]
+
+    # Helper: condizioni di buffer e retest su breakout/breakdown
+    def breakout_ok(level):
+        buf = level * (1 + BUFFER_PCT)
+        retest_tol = level * (1 + RETEST_TOL_PCT)
+        # (A) chiusura sopra buffer
+        cond_a = last["close"] > buf and prev["close"] <= buf
+        # (B) retest: candela attuale ha fatto low <= livello (tolleranza) ma chiude sopra buffer
+        cond_b = (last["low"] <= retest_tol) and (last["close"] > buf)
+        return cond_a or cond_b
+
+    def breakdown_ok(level):
+        buf = level * (1 - BUFFER_PCT)
+        retest_tol = level * (1 - RETEST_TOL_PCT)
+        cond_a = last["close"] < buf and prev["close"] >= buf
+        cond_b = (last["high"] >= retest_tol) and (last["close"] < buf)
+        return cond_a or cond_b
+
+    # --- Breakout LONG
     for level in levels["breakout"]:
-        if price >= level and ema20 > ema60 and valid_break(level, price):
+        if price >= level and ema20 > ema60 and valid_break(level, price) and breakout_ok(level):
             if volume > vol_thresh and last_signal[symbol] != "LONG":
-                open_trade(symbol, "LONG", price)
+                open_trade(symbol, "LONG", float(last["close"]), atr14)
                 last_signal[symbol] = "LONG"
             elif volume <= vol_thresh:
                 send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
 
-    # Breakdown SHORT
+    # --- Breakdown SHORT
     for level in levels["breakdown"]:
-        if price <= level and ema20 < ema60 and valid_break(level, price):
+        if price <= level and ema20 < ema60 and valid_break(level, price) and breakdown_ok(level):
             if volume > vol_thresh and last_signal[symbol] != "SHORT":
-                open_trade(symbol, "SHORT", price)
+                open_trade(symbol, "SHORT", float(last["close"]), atr14)
                 last_signal[symbol] = "SHORT"
             elif volume <= vol_thresh:
                 send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
@@ -308,7 +374,7 @@ def build_suggestion(btc_trend, eth_trend):
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot PRO attivo – Segnali Fortissimi con TP/SL dinamici (Apple Watch ready)")
+    send_telegram_message("✅ Bot PRO attivo – Segnali con ATR, Buffer/Retest e Break-even (Apple Watch ready)")
 
     while True:
         now_it = datetime.now(tz=ZoneInfo("Europe/Rome")).strftime("%H:%M")
@@ -320,15 +386,15 @@ if __name__ == "__main__":
         for symbol in ["BTC", "ETH"]:
             analysis = analyze(symbol)
             if analysis:
-                price = analysis["price"]
+                price  = analysis["price"]
                 volume = analysis["volume"]
-                ema20 = analysis["ema20"]
-                ema60 = analysis["ema60"]
+                ema20  = analysis["ema20"]
+                ema60  = analysis["ema60"]
 
-                # Controlla segnali
+                # Controlla segnali con nuove regole robuste
                 check_signal(symbol, analysis, LEVELS[symbol])
 
-                # Monitora eventuale trade aperto
+                # Monitora eventuale trade aperto (TP/SL + break-even)
                 monitor_trade(symbol, price)
 
                 # Aggiungi trend
@@ -340,8 +406,7 @@ if __name__ == "__main__":
                 report_msg += f"\n{symbol}: Errore dati"
                 trends[symbol] = "⚪"
 
-        # Aggiungi suggerimento operativo
         report_msg += f"\n\n{build_suggestion(trends['BTC'], trends['ETH'])}"
-
         send_telegram_message(report_msg)
+
         time.sleep(1800)  # Report ogni 30 min

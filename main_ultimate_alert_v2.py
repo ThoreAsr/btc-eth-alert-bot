@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 from datetime import datetime, timedelta
@@ -37,6 +38,10 @@ KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m
 last_signal  = {"BTC": None, "ETH": None}
 active_trade = {"BTC": None, "ETH": None}  # Salva target e stop e metadata
 
+# Startup flag per evitare messaggi ripetuti a ogni riavvio
+STARTUP_FLAG = "/tmp/bot_startup_flag.txt"
+STARTUP_COOLDOWN_SEC = 12 * 3600  # 12 ore
+
 
 # --- UTILITY TELEGRAM ---
 def send_telegram_message(message: str):
@@ -46,6 +51,21 @@ def send_telegram_message(message: str):
         requests.post(url, data=payload, timeout=5)
     except Exception as e:
         print(f"Errore invio Telegram: {e}")
+
+
+def send_startup_once():
+    """Invia il messaggio iniziale solo una volta ogni 12 ore."""
+    try:
+        if os.path.exists(STARTUP_FLAG):
+            with open(STARTUP_FLAG, "r") as f:
+                ts = float((f.read() or "0").strip())
+            if time.time() - ts < STARTUP_COOLDOWN_SEC:
+                return
+        send_telegram_message("✅ Bot PRO attivo – Segnali con ATR, Buffer/Retest e Break-even (Apple Watch ready)")
+        with open(STARTUP_FLAG, "w") as f:
+            f.write(str(time.time()))
+    except Exception as e:
+        print("Startup message skipped:", e)
 
 
 def get_klines(symbol: str):
@@ -374,7 +394,8 @@ def build_suggestion(btc_trend, eth_trend):
 
 # --- MAIN LOOP ---
 if __name__ == "__main__":
-    send_telegram_message("✅ Bot PRO attivo – Segnali con ATR, Buffer/Retest e Break-even (Apple Watch ready)")
+    # Messaggio iniziale SOLO una volta ogni 12 ore
+    send_startup_once()
 
     while True:
         now_it = datetime.now(tz=ZoneInfo("Europe/Rome")).strftime("%H:%M")

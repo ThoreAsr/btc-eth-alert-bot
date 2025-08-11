@@ -8,6 +8,7 @@ import io
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
+import numpy as np
 # ============================
 
 # --- CONFIGURAZIONE ---
@@ -62,7 +63,7 @@ def calc_ema(prices, period):
 
 # === FUNZIONI NUOVE: grafico + notifica ottimizzata ===
 def build_chart_for(symbol, entry, tp, sl):
-    """Crea grafico 15m con MACD & KDJ e restituisce BytesIO pronto per Telegram."""
+    """Crea grafico 15m con MACD & KDJ (linee ben differenziate) e ritorna BytesIO pronto per Telegram."""
     data = get_klines(symbol)
     if not data:
         raise RuntimeError("Dati klines non disponibili")
@@ -74,14 +75,14 @@ def build_chart_for(symbol, entry, tp, sl):
 
     df = pd.DataFrame({"time": times, "close": closes, "high": highs, "low": lows})
 
-    # MACD (12,26,9)
+    # --- MACD (12,26,9)
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    # KDJ (9,3,3)
+    # --- KDJ (9,3,3)
     low_min = df["low"].rolling(window=9).min()
     high_max = df["high"].rolling(window=9).max()
     rsv = (df["close"] - low_min) / (high_max - low_min) * 100
@@ -89,30 +90,51 @@ def build_chart_for(symbol, entry, tp, sl):
     df["D"] = df["K"].ewm(com=2).mean()
     df["J"] = 3*df["K"] - 2*df["D"]
 
-    # Grafico (prezzo + MACD + KDJ)
+    # --- Figura
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11,8), sharex=True,
                                         gridspec_kw={'height_ratios':[3,1,1]})
-    ax1.plot(df["time"], df["close"], label=f"{symbol}/USDT")
-    ax1.axhline(entry, linestyle="--", label="Entrata")
-    ax1.axhline(tp,    linestyle="--", label="Target")
-    ax1.axhline(sl,    linestyle="--", label="Stop")
-    ax1.legend(); ax1.grid(True); ax1.set_ylabel("USDT")
 
+    # Prezzo
+    ax1.plot(df["time"], df["close"], label=f"{symbol}/USDT")
+    ax1.grid(True, linewidth=0.4)
+
+    # Linee ben differenziate
+    ax1.axhline(entry, color="#16a34a", linestyle="--", linewidth=2.2, label="Entrata")      # verde
+    ax1.axhline(tp,    color="#f59e0b", linestyle=(0,(9,4)), linewidth=2.2, label="Target")  # arancione dash lungo
+    ax1.axhline(sl,    color="#ef4444", linestyle=(0,(3,3)), linewidth=2.2, label="Stop")    # rosso dash corto
+
+    # Etichette valori sul bordo destro
+    def annotate_hline(y, text, color):
+        ax1.text(df["time"].iloc[-1], y, f"  {text}", color=color,
+                 va="center", fontsize=10, bbox=dict(facecolor="white", alpha=0.7, edgecolor=color))
+    annotate_hline(entry, f"Entrata {round(entry,2)}", "#16a34a")
+    annotate_hline(tp,    f"Target {round(tp,2)}",   "#f59e0b")
+    annotate_hline(sl,    f"Stop {round(sl,2)}",     "#ef4444")
+
+    ax1.set_ylabel("USDT")
+    ax1.legend(loc="upper left")
+
+    # MACD con hist verde/rosso
+    colors = np.where(df["MACD_HIST"]>=0, "#16a34a", "#ef4444")
+    ax2.bar(df["time"], df["MACD_HIST"], color=colors, label="Hist")
     ax2.plot(df["time"], df["MACD"], label="MACD")
     ax2.plot(df["time"], df["MACD_SIGNAL"], label="Signal")
-    ax2.bar(df["time"], df["MACD_HIST"], label="Hist")
-    ax2.legend(); ax2.grid(True)
+    ax2.grid(True, linewidth=0.4)
+    ax2.legend(loc="upper left")
 
+    # KDJ
     ax3.plot(df["time"], df["K"], label="K")
     ax3.plot(df["time"], df["D"], label="D")
     ax3.plot(df["time"], df["J"], label="J")
-    ax3.legend(); ax3.grid(True)
+    ax3.grid(True, linewidth=0.4)
+    ax3.legend(loc="upper left")
 
     ax3.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-    plt.xticks(rotation=45); plt.tight_layout()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
 
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    plt.savefig(buf, format="png", dpi=220, bbox_inches="tight")
     plt.close(fig); buf.seek(0)
     return buf
 
@@ -120,11 +142,10 @@ def build_chart_for(symbol, entry, tp, sl):
 def notify_signal(symbol, direction, entry, tp, sl):
     """
     Notifica ottimizzata per lock screen / Apple Watch:
-    - PRIMA RIGA chiarissima: LONG/SHORT + simbolo + TF + prezzo.
-    - Poi dettagli.
-    - E invio grafico 15m con MACD/KDJ.
+    - Prima riga chiarissima: LONG/SHORT + simbolo + 15m + prezzo.
+    - Subito dopo dettagli compatti.
+    - Foto con grafico 15m (prezzo + Entrata/Target/Stop + MACD/KDJ).
     """
-    # Titolo super breve (quello che leggi sulla notifica)
     title = f"🚨 {direction} {symbol} 15m | Ingresso {round(entry,2)}"
     try:
         requests.post(
@@ -134,7 +155,6 @@ def notify_signal(symbol, direction, entry, tp, sl):
     except Exception as e:
         print("Errore invio titolo notifica:", e)
 
-    # Corpo (subito dopo, nella stessa chat)
     body = (
         f"🎯 Target: {round(tp,2)}   🛑 Stop: {round(sl,2)}\n"
         f"⏱️ TF: 15m   📊 Vol: auto\n"
@@ -148,7 +168,6 @@ def notify_signal(symbol, direction, entry, tp, sl):
     except Exception as e:
         print("Errore invio corpo notifica:", e)
 
-    # Grafico
     try:
         chart = build_chart_for(symbol, entry, tp, sl)
         requests.post(
@@ -203,10 +222,9 @@ def open_trade(symbol, direction, entry_price):
         "sl": sl
     }
 
-    # ======= NUOVA NOTIFICA + GRAFICO (LONG/SHORT) =======
-    # Prima riga chiarissima in notifica + dettagli + grafico 15m
+    # ======= NOTIFICA + GRAFICO (LONG/SHORT) =======
     notify_signal(symbol, direction, entry_price, tp, sl)
-    # =====================================================
+    # ===============================================
 
 
 def monitor_trade(symbol, price):

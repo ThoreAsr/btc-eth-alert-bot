@@ -12,6 +12,20 @@ import matplotlib.dates as mdates
 import pandas as pd
 import numpy as np
 
+# ---------- FUNZIONI BASE MANCANTI (aggiunta) ----------
+def calc_ema(data, period):
+    """Calcola una EMA semplice su una lista di prezzi."""
+    if not data:
+        return 0.0
+    if len(data) < period:
+        return sum(data) / len(data)
+    k = 2 / (period + 1)
+    ema = data[0]
+    for price in data[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+# -------------------------------------------------------
+
 # ================== CONFIG ==================
 TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
 CHAT_ID = "-1002181919588"
@@ -243,7 +257,6 @@ def vol_filter(df15):
 def squeeze_ok(df15, direction):
     if not USE_BB_SQUEEZE: return True
     last = df15.iloc[-1]
-    # squeeze recente (nelle ultime 10 barre)
     recent = df15.tail(10)
     sq = (recent["BB_BW"] < BB_SQ_THRESHOLD).any()
     if not sq: return False
@@ -281,7 +294,6 @@ def analyze(symbol):
     return {"price": last_close, "volume": last_vol, "ema20": ema20, "ema60": ema60, "atr": atr14, "df": df}
 
 def open_trade(symbol, direction, entry_price, atr, rr_checked=True):
-    # ATR-based TP/SL
     if direction=="LONG":
         sl = entry_price - ATR_SL_MULT*atr
         tp = entry_price + ATR_TP_MULT*atr
@@ -308,7 +320,6 @@ def monitor_trade(symbol, price, df15):
     if not t: return
     direction = t["direction"]; entry = t["entry"]; tp=t["tp"]; sl=t["sl"]
 
-    # +1R?
     risk = abs(entry-sl)
     if not t["touched_1R"]:
         if (direction=="LONG" and price >= entry + risk) or (direction=="SHORT" and price <= entry - risk):
@@ -318,7 +329,6 @@ def monitor_trade(symbol, price, df15):
                 t["partial_done"] = True
                 send_telegram_message(f"💰 {symbol}: chiusa PARZIALE 50% a +1R (simulato)")
 
-    # Trailing Chandelier dopo +1R
     if USE_TRAILING_CH and t["touched_1R"]:
         if len(df15) >= CH_PERIOD:
             if direction=="LONG":
@@ -330,7 +340,6 @@ def monitor_trade(symbol, price, df15):
                 ch = ll + CH_ATR_MULT*df15["ATR"].iloc[-1]
                 t["sl"] = min(t["sl"], ch)
 
-    # Time-stop
     if USE_TIMESTOP:
         bars = int((datetime.now(tzUTC) - t["opened_at"]).total_seconds() // (15*60))
         macd = df15["MACD"].iloc[-1]; sig = df15["MACD_SIGNAL"].iloc[-1]
@@ -339,31 +348,26 @@ def monitor_trade(symbol, price, df15):
             t["sl"] = entry
             send_telegram_message(f"⏱️ {symbol} {direction}: time-stop → SL a BE")
 
-    # Esiti
     if direction=="LONG":
         if price >= tp:
             send_telegram_message(f"✅ TP LONG {symbol} a {round(tp,2)}")
             log_trade([datetime.now(tzUTC),symbol,"LONG",entry,tp,t['sl'],tp,"TP",round((tp-entry)/risk,2)])
-            active_trade[symbol]=None
-            return
+            active_trade[symbol]=None; return
         if price <= t["sl"]:
             res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
             send_telegram_message(f"❌ {res} LONG {symbol} a {round(t['sl'],2)}")
             log_trade([datetime.now(tzUTC),symbol,"LONG",entry,tp,t['sl'],t['sl'],res,round((tp-entry)/risk,2)])
-            active_trade[symbol]=None
-            return
+            active_trade[symbol]=None; return
     else:
         if price <= tp:
             send_telegram_message(f"✅ TP SHORT {symbol} a {round(tp,2)}")
             log_trade([datetime.now(tzUTC),symbol,"SHORT",entry,tp,t['sl'],tp,"TP",round((entry-tp)/risk,2)])
-            active_trade[symbol]=None
-            return
+            active_trade[symbol]=None; return
         if price >= t["sl"]:
             res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
             send_telegram_message(f"❌ {res} SHORT {symbol} a {round(t['sl'],2)}")
             log_trade([datetime.now(tzUTC),symbol,"SHORT",entry,tp,t['sl'],t['sl'],res,round((entry-tp)/risk,2)])
-            active_trade[symbol]=None
-            return
+            active_trade[symbol]=None; return
 
 # ------------- CHECK SEGNALE -------------
 def check_signal(symbol, an, levels):
@@ -396,15 +400,11 @@ def check_signal(symbol, an, levels):
         if price>=level and ema20>ema60 and valid_break(level,price) and breakout_ok(level):
             if volume_usdt>vol_thresh and (last_signal[symbol]!="LONG"):
                 if USE_VOL_FILTER and not vol_filter(df): 
-                    send_telegram_message(f"⏭️ {symbol} LONG: vol debole")
-                    continue
+                    send_telegram_message(f"⏭️ {symbol} LONG: vol debole"); continue
                 if USE_BB_SQUEEZE and not squeeze_ok(df,"LONG"):
-                    send_telegram_message(f"⏭️ {symbol} LONG: no squeeze/banda")
-                    continue
+                    send_telegram_message(f"⏭️ {symbol} LONG: no squeeze/banda"); continue
                 if USE_MTF and not mtf_filter(symbol,"LONG"):
-                    send_telegram_message(f"⏭️ {symbol} LONG: 1h non allineato")
-                    continue
-                # ATR RR check inside
+                    send_telegram_message(f"⏭️ {symbol} LONG: 1h non allineato"); continue
                 open_trade(symbol,"LONG", float(last["close"]), atr, rr_checked=False)
                 last_signal[symbol]="LONG"
             elif volume_usdt<=vol_thresh:
@@ -415,20 +415,16 @@ def check_signal(symbol, an, levels):
         if price<=level and ema20<ema60 and valid_break(level,price) and breakdown_ok(level):
             if volume_usdt>vol_thresh and (last_signal[symbol]!="SHORT"):
                 if USE_VOL_FILTER and not vol_filter(df):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: vol debole")
-                    continue
+                    send_telegram_message(f"⏭️ {symbol} SHORT: vol debole"); continue
                 if USE_BB_SQUEEZE and not squeeze_ok(df,"SHORT"):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: no squeeze/banda")
-                    continue
+                    send_telegram_message(f"⏭️ {symbol} SHORT: no squeeze/banda"); continue
                 if USE_MTF and not mtf_filter(symbol,"SHORT"):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: 1h non allineato")
-                    continue
+                    send_telegram_message(f"⏭️ {symbol} SHORT: 1h non allineato"); continue
                 open_trade(symbol,"SHORT", float(last["close"]), atr, rr_checked=False)
                 last_signal[symbol]="SHORT"
             elif volume_usdt<=vol_thresh:
                 send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
 
-    # Reset segnale se neutro
     if levels["breakdown"][-1] < price < levels["breakout"][0]:
         last_signal[symbol]=None
 
@@ -443,7 +439,6 @@ def build_suggestion(btc_trend, eth_trend):
     return "Suggerimento: Trend misto – Attendere conferma ⚠️"
 
 def maybe_send_daily_report():
-    # 23:59 Italia
     now_it = datetime.now(tzIT)
     hh, mm = DAILY_REPORT_IT_HM
     if now_it.strftime("%H")==hh and now_it.strftime("%M")==mm:

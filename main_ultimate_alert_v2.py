@@ -1,8 +1,9 @@
 import os
+import csv
 import time
 import requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo  # per gestire fusi orari
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 # === LIBRERIE PER GRAFICI ===
 import io
@@ -11,97 +12,110 @@ import matplotlib.dates as mdates
 import pandas as pd
 import numpy as np
 
-# --- CONFIGURAZIONE ---
+# ================== CONFIG ==================
 TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
-CHAT_ID = "-1002181919588"  # ID gruppo Bot_BTC_ETH_Famiglia
+CHAT_ID = "-1002181919588"
 
+# Livelli tuo setup
 LEVELS = {
     "BTC": {"breakout": [117700, 118300], "breakdown": [116800, 116300]},
     "ETH": {"breakout": [3190, 3250],    "breakdown": [3120, 3070]}
 }
 
-VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT nominali
-MIN_MOVE_PCT = 0.2   # % minima di superamento livello (residuo della tua logica)
+# Soglie base
+VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT
+MIN_MOVE_PCT = 0.2/100
 
-# --- Parametri robustezza ---
-BUFFER_PCT      = 0.0005  # 0.05%: chiusura oltre livello per conferma
-RETEST_TOL_PCT  = 0.0002  # 0.02%: tolleranza di retest sul livello
-ATR_PERIOD      = 14
-ATR_SL_MULT     = 1.2
-ATR_TP_MULT     = 2.0
-MIN_RR          = 1.5     # R/R minimo
-BE_TRIGGER_PCT  = 0.004   # +0.4% a favore
-BE_WINDOW_CAND  = 2       # entro 2 candele da apertura
+# ATR & gestione trade
+ATR_PERIOD   = 14
+ATR_SL_MULT  = 1.2
+ATR_TP_MULT  = 2.0
+MIN_RR       = 1.5
+BE_TRIGGER   = 0.004      # +0.4%
+BE_WINDOW    = 2          # candele 15m
 
-KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m&limit=120"
+# Buffer/Retest
+BUFFER_PCT     = 0.05/100
+RETEST_TOL_PCT = 0.02/100
+
+# === Precision Pack toggles ===
+USE_MTF            = True   # filtro 1h
+USE_VOL_FILTER     = True   # vol 15m > 1.2× mediana 20
+VOL_MULT           = 1.2
+QUIET_HOURS_UTC    = [(0,3)]  # no trade tra 00:00–03:59 UTC
+USE_BB_SQUEEZE     = True   # breakout dopo squeeze + close oltre banda
+BB_WINDOW          = 20
+BB_SQ_THRESHOLD    = 0.06   # banda stretta: (upper-lower)/mid < 0.06 (~6%)
+USE_PARTIAL_1R     = True   # chiusura 50% a +1R
+USE_TRAILING_CH    = True   # trailing chandelier dopo +1R
+CH_PERIOD          = 22
+CH_ATR_MULT        = 2.5
+USE_TIMESTOP       = True   # esci a BE se dopo 8 barre MACD contro
+TIMESTOP_BARS      = 8
+
+# Report giornaliero
+DAILY_REPORT_IT_HM = ("23","59")  # Italia
+
+# API
+KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
 
 # Stato segnali
 last_signal  = {"BTC": None, "ETH": None}
-active_trade = {"BTC": None, "ETH": None}  # Salva target/stop/metadata
+active_trade = {"BTC": None, "ETH": None}
 
-# Startup flag per evitare messaggi ripetuti a ogni riavvio
+# Startup flag 12h
 STARTUP_FLAG = "/tmp/bot_startup_flag.txt"
-STARTUP_COOLDOWN_SEC = 12 * 3600  # 12 ore
+STARTUP_COOLDOWN_SEC = 12 * 3600
 
+TRADES_CSV = "/tmp/trades.csv"
+tzIT = ZoneInfo("Europe/Rome")
+tzUTC = ZoneInfo("UTC")
 
-# --- UTILITY TELEGRAM ---
+# ---------------- TELEGRAM ----------------
 def send_telegram_message(message: str):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=payload, timeout=5)
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": CHAT_ID, "text": message}, timeout=5)
     except Exception as e:
-        print(f"Errore invio Telegram: {e}")
+        print("TG error:", e)
 
+def send_photo(buf: bytes, caption: str):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+                      data={"chat_id": CHAT_ID, "caption": caption},
+                      files={"photo": ("chart.png", buf)}, timeout=15)
+    except Exception as e:
+        print("TG photo error:", e)
 
 def send_startup_once():
-    """Invia il messaggio iniziale solo una volta ogni 12 ore."""
     try:
         if os.path.exists(STARTUP_FLAG):
-            with open(STARTUP_FLAG, "r") as f:
+            with open(STARTUP_FLAG,"r") as f:
                 ts = float((f.read() or "0").strip())
             if time.time() - ts < STARTUP_COOLDOWN_SEC:
                 return
-        send_telegram_message("✅ Bot PRO attivo – Segnali con ATR, Buffer/Retest e Break-even (Apple Watch ready)")
-        with open(STARTUP_FLAG, "w") as f:
+        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 (MTF, Vol, Squeeze, Parziale+Trailing, Time-stop)")
+        with open(STARTUP_FLAG,"w") as f:
             f.write(str(time.time()))
     except Exception as e:
-        print("Startup message skipped:", e)
+        print("startup flag err:", e)
 
-
-def get_klines(symbol: str):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    url = KLINE_URL.format(symbol=symbol)
+# ---------------- DATA ----------------
+def get_klines(symbol: str, interval="15m", limit=120):
+    url = KLINE_URL.format(symbol=symbol, interval=interval, limit=limit)
     try:
-        resp = requests.get(url, headers=headers, timeout=7)
+        resp = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
         return resp.json()
     except Exception as e:
-        print(f"Errore klines {symbol}: {e}")
+        print("klines err:", e)
         return None
 
-
-def calc_ema(prices, period):
-    k = 2 / (period + 1)
-    ema = prices[0]
-    for price in prices[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-
-
-# ========== FIX ROBUSTA KLINES (8 o 12 colonne) + INDICATORI ==========
-def build_df(symbol):
-    """
-    Restituisce DataFrame 15m con OHLCV e indicatori base + ATR.
-    Tollerante: supporta sia klines a 12 campi (standard MEXC) sia a 8 campi.
-    """
-    data = get_klines(symbol)
-    if not isinstance(data, list) or (len(data) and not isinstance(data[0], (list, tuple))):
-        print(f"[WARN] Risposta inattesa MEXC per {symbol}: {str(data)[:120]}")
-        send_telegram_message(f"⚠️ Dati {symbol} temporaneamente non disponibili (API). Riprovo…")
+def build_df(symbol, interval="15m", limit=120):
+    data = get_klines(symbol, interval, limit)
+    if not isinstance(data, list) or (len(data) and not isinstance(data[0], (list,tuple))):
+        print(f"[WARN] API {symbol} risponde strana.")
         return None
-    if not data:
-        print(f"[WARN] Nessun dato kline per {symbol}")
-        return None
+    if not data: return None
 
     rows = []
     for r in data:
@@ -109,354 +123,367 @@ def build_df(symbol):
             open_time, open_, high, low, close, volume, close_time, quote_vol, trades, tb_base, tb_quote, *_ = r
         elif len(r) >= 8:
             open_time, open_, high, low, close, volume, close_time, quote_vol = r[:8]
-            trades = 0
-            tb_base = 0.0
-            tb_quote = 0.0
+            trades, tb_base, tb_quote = 0, 0.0, 0.0
         else:
             continue
-
         rows.append({
-            "open_time":   pd.to_datetime(int(open_time), unit="ms"),
-            "open":        float(open_),
-            "high":        float(high),
-            "low":         float(low),
-            "close":       float(close),
-            "volume":      float(volume),
-            "close_time":  pd.to_datetime(int(close_time), unit="ms"),
-            "quote_vol":   float(quote_vol) if quote_vol is not None else 0.0,
-            "trades":      int(trades) if trades is not None else 0,
-            "tb_base":     float(tb_base),
-            "tb_quote":    float(tb_quote),
+            "open_time":  pd.to_datetime(int(open_time), unit="ms"),
+            "open":  float(open_), "high": float(high), "low": float(low),
+            "close": float(close), "volume": float(volume),
+            "close_time": pd.to_datetime(int(close_time), unit="ms"),
         })
-
-    if not rows:
-        print(f"[WARN] Tutte le righe scartate per {symbol}")
-        return None
-
+    if not rows: return None
     df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
 
-    # --- ATR (14)
+    # ATR
     prev_close = df["close"].shift(1)
     tr = pd.concat([
-        (df["high"] - df["low"]).abs(),
-        (df["high"] - prev_close).abs(),
-        (df["low"]  - prev_close).abs()
+        (df["high"]-df["low"]).abs(),
+        (df["high"]-prev_close).abs(),
+        (df["low"] -prev_close).abs()
     ], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean().bfill()
 
-    # --- MACD (12,26,9)
+    # MACD
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    # --- KDJ (9,3,3)
-    low_min = df["low"].rolling(window=9, min_periods=9).min()
+    # KDJ
+    low_min  = df["low"].rolling(window=9, min_periods=9).min()
     high_max = df["high"].rolling(window=9, min_periods=9).max()
     denom = (high_max - low_min).replace(0, np.nan)
     rsv = (df["close"] - low_min) / denom * 100
     df["K"] = rsv.ewm(com=2, adjust=False).mean()
     df["D"] = df["K"].ewm(com=2, adjust=False).mean()
-    df["J"] = 3 * df["K"] - 2 * df["D"]
+    df["J"] = 3*df["K"] - 2*df["D"]
+
+    # Bollinger
+    mid = df["close"].rolling(BB_WINDOW).mean()
+    std = df["close"].rolling(BB_WINDOW).std()
+    df["BB_MID"] = mid
+    df["BB_UP"]  = mid + 2*std
+    df["BB_LOW"] = mid - 2*std
+    df["BB_BW"]  = (df["BB_UP"]-df["BB_LOW"])/mid  # bandwidth
+
+    # EMA per MTF checks
+    df["EMA50"]  = df["close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
 
     return df
-# ======================================================================
 
-
-# === GRAFICO + NOTIFICA ottimizzata ===
+# ------------- NOTIFICA + GRAFICO -------------
 def build_chart_for(symbol, entry, tp, sl):
-    df = build_df(symbol)
-    if df is None:
-        raise RuntimeError("Dati klines non disponibili")
+    df = build_df(symbol, "15m", 120)
+    if df is None: raise RuntimeError("No data")
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11,8), sharex=True,
+    fig, (ax1, ax2, ax3) = plt.subplots(3,1,figsize=(11,8),sharex=True,
                                         gridspec_kw={'height_ratios':[3,1,1]})
-    # Prezzo
     ax1.plot(df["close_time"], df["close"], label=f"{symbol}/USDT")
     ax1.grid(True, linewidth=0.4)
+    ax1.axhline(entry, color="#16a34a", linestyle="--",      linewidth=2.2, label="Entrata")
+    ax1.axhline(tp,    color="#f59e0b", linestyle=(0,(9,4)), linewidth=2.2, label="Target")
+    ax1.axhline(sl,    color="#ef4444", linestyle=(0,(3,3)), linewidth=2.2, label="Stop")
+    def annotate(y, text, c):
+        ax1.text(df["close_time"].iloc[-1], y, f"  {text}", color=c,
+                 va="center", fontsize=10, bbox=dict(facecolor="white", alpha=0.7, edgecolor=c))
+    annotate(entry, f"Entrata {round(entry,2)}", "#16a34a")
+    annotate(tp,    f"Target {round(tp,2)}",     "#f59e0b")
+    annotate(sl,    f"Stop {round(sl,2)}",       "#ef4444")
+    ax1.set_ylabel("USDT"); ax1.legend(loc="upper left")
 
-    # Linee ben differenziate
-    ax1.axhline(entry, color="#16a34a", linestyle="--",      linewidth=2.2, label="Entrata")  # verde
-    ax1.axhline(tp,    color="#f59e0b", linestyle=(0,(9,4)), linewidth=2.2, label="Target")   # arancione
-    ax1.axhline(sl,    color="#ef4444", linestyle=(0,(3,3)), linewidth=2.2, label="Stop")     # rosso
-
-    # Etichette
-    def annotate_hline(y, text, color):
-        ax1.text(df["close_time"].iloc[-1], y, f"  {text}", color=color,
-                 va="center", fontsize=10, bbox=dict(facecolor="white", alpha=0.7, edgecolor=color))
-    annotate_hline(entry, f"Entrata {round(entry,2)}", "#16a34a")
-    annotate_hline(tp,    f"Target {round(tp,2)}",     "#f59e0b")
-    annotate_hline(sl,    f"Stop {round(sl,2)}",       "#ef4444")
-
-    ax1.set_ylabel("USDT")
-    ax1.legend(loc="upper left")
-
-    # MACD istogramma verde/rosso
     colors = np.where(df["MACD_HIST"]>=0, "#16a34a", "#ef4444")
     ax2.bar(df["close_time"], df["MACD_HIST"], color=colors, label="Hist")
     ax2.plot(df["close_time"], df["MACD"], label="MACD")
     ax2.plot(df["close_time"], df["MACD_SIGNAL"], label="Signal")
-    ax2.grid(True, linewidth=0.4)
-    ax2.legend(loc="upper left")
+    ax2.grid(True, linewidth=0.4); ax2.legend(loc="upper left")
 
-    # KDJ
     ax3.plot(df["close_time"], df["K"], label="K")
     ax3.plot(df["close_time"], df["D"], label="D")
     ax3.plot(df["close_time"], df["J"], label="J")
-    ax3.grid(True, linewidth=0.4)
-    ax3.legend(loc="upper left")
+    ax3.grid(True, linewidth=0.4); ax3.legend(loc="upper left")
 
     ax3.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=220, bbox_inches="tight")
+    plt.xticks(rotation=45); plt.tight_layout()
+    buf = io.BytesIO(); plt.savefig(buf, format="png", dpi=220, bbox_inches="tight")
     plt.close(fig); buf.seek(0)
-    return buf
-
+    return buf.getvalue()
 
 def notify_signal(symbol, direction, entry, tp, sl):
-    title = f"🚨 {direction} {symbol} 15m | Ingresso {round(entry,2)}"
+    send_telegram_message(f"🚨 {direction} {symbol} 15m | Ingresso {round(entry,2)}")
+    send_telegram_message(f"🎯 Target: {round(tp,2)}   🛑 Stop: {round(sl,2)}\n⏱️ TF: 15m   📊 Vol: auto\nEntra solo se sei operativo.")
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": title}, timeout=5
-        )
+        send_photo(build_chart_for(symbol, entry, tp, sl), "📸 Grafico 15m con MACD & KDJ")
     except Exception as e:
-        print("Errore invio titolo notifica:", e)
+        print("chart err:", e)
 
-    body = (
-        f"🎯 Target: {round(tp,2)}   🛑 Stop: {round(sl,2)}\n"
-        f"⏱️ TF: 15m   📊 Vol: auto\n"
-        f"Entra solo se sei operativo."
-    )
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": body}, timeout=5
-        )
-    except Exception as e:
-        print("Errore invio corpo notifica:", e)
+# ------------- UTILITY -------------
+def in_quiet_hours_now():
+    now_utc = datetime.now(tzUTC).hour
+    for start,end in QUIET_HOURS_UTC:
+        if start <= now_utc <= end:
+            return True
+    return False
 
-    try:
-        chart = build_chart_for(symbol, entry, tp, sl)
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-            data={"chat_id": CHAT_ID, "caption": "📸 Grafico 15m con MACD & KDJ"},
-            files={"photo": ("chart.png", chart.getvalue())},
-            timeout=15
-        )
-    except Exception as e:
-        print("Errore invio grafico:", e)
+def mtf_filter(symbol, direction):
+    if not USE_MTF: return True
+    df1h = build_df(symbol, "1h", 300)
+    if df1h is None or len(df1h) < 200: return True
+    ema50, ema200 = df1h["EMA50"].iloc[-1], df1h["EMA200"].iloc[-1]
+    return (direction=="LONG" and ema50>ema200) or (direction=="SHORT" and ema50<ema200)
 
+def vol_filter(df15):
+    if not USE_VOL_FILTER: return True
+    v = df15["volume"].iloc[-1]
+    med = df15["volume"].tail(20).median()
+    return v > VOL_MULT*med
 
-# --- ANALISI DATI BASE (per report) ---
+def squeeze_ok(df15, direction):
+    if not USE_BB_SQUEEZE: return True
+    last = df15.iloc[-1]
+    # squeeze recente (nelle ultime 10 barre)
+    recent = df15.tail(10)
+    sq = (recent["BB_BW"] < BB_SQ_THRESHOLD).any()
+    if not sq: return False
+    if direction=="LONG":
+        return last["close"] > last["BB_UP"]
+    else:
+        return last["close"] < last["BB_LOW"]
+
+def rr_ok(entry, tp, sl):
+    risk = abs(entry - sl); reward = abs(tp - entry)
+    rr = reward/max(risk,1e-9)
+    return rr >= MIN_RR, rr
+
+def log_trade(row):
+    header = ["time_utc","symbol","direction","entry","tp","sl","exit_price","result","rr"]
+    exists = os.path.exists(TRADES_CSV)
+    with open(TRADES_CSV,"a",newline="") as f:
+        w=csv.writer(f)
+        if not exists: w.writerow(header)
+        w.writerow(row)
+
+# ------------- ANALISI/SEGNALI -------------
 def analyze(symbol):
-    df = build_df(symbol)
+    df = build_df(symbol, "15m", 120)
     if df is None:
         send_telegram_message(f"⚠️ Errore dati {symbol}")
         return None
-
     closes = df["close"].tolist()
-    base_volumes = df["volume"].tolist()
-    usdt_volumes = [closes[i] * base_volumes[i] for i in range(len(closes))]
-
+    vols   = df["volume"].tolist()
     last_close = closes[-1]
-    last_volume = usdt_volumes[-1]
+    last_vol   = closes[-1]*vols[-1]
     ema20 = calc_ema(closes[-20:], 20)
     ema60 = calc_ema(closes[-60:], 60)
     atr14 = df["ATR"].iloc[-1]
+    return {"price": last_close, "volume": last_vol, "ema20": ema20, "ema60": ema60, "atr": atr14, "df": df}
 
-    return {
-        "price": last_close,
-        "volume": last_volume,
-        "ema20": ema20,
-        "ema60": ema60,
-        "atr":  atr14
-    }
-
-
-# --- TRADE MANAGEMENT ---
-def open_trade(symbol, direction, entry_price, atr):
-    """ATR-based TP/SL + R/R minimo + metadata per break-even."""
-    if direction == "LONG":
-        sl = entry_price - ATR_SL_MULT * atr
-        tp = entry_price + ATR_TP_MULT * atr
-        risk = entry_price - sl
-        reward = tp - entry_price
+def open_trade(symbol, direction, entry_price, atr, rr_checked=True):
+    # ATR-based TP/SL
+    if direction=="LONG":
+        sl = entry_price - ATR_SL_MULT*atr
+        tp = entry_price + ATR_TP_MULT*atr
     else:
-        sl = entry_price + ATR_SL_MULT * atr
-        tp = entry_price - ATR_TP_MULT * atr
-        risk = sl - entry_price
-        reward = entry_price - tp
+        sl = entry_price + ATR_SL_MULT*atr
+        tp = entry_price - ATR_TP_MULT*atr
 
-    rr = reward / max(risk, 1e-9)
-    if rr < MIN_RR:
-        send_telegram_message(f"⏭️ {symbol} {direction}: R/R {rr:.2f} < {MIN_RR}, segnale saltato")
-        return
+    ok, rr = (True, None)
+    if not rr_checked:
+        ok, rr = rr_ok(entry_price, tp, sl)
+        if not ok:
+            send_telegram_message(f"⏭️ {symbol} {direction}: R/R {rr:.2f} < {MIN_RR}, skip")
+            return
 
     active_trade[symbol] = {
-        "direction": direction,
-        "entry": entry_price,
-        "tp": tp,
-        "sl": sl,
-        "opened_at": datetime.now(tz=ZoneInfo("UTC")),  # per BE
-        "moved_to_be": False
+        "direction": direction, "entry": entry_price, "tp": tp, "sl": sl,
+        "opened_at": datetime.now(tzUTC), "moved_to_be": False,
+        "t0_idx": None, "touched_1R": False, "partial_done": False
     }
-
     notify_signal(symbol, direction, entry_price, tp, sl)
 
+def monitor_trade(symbol, price, df15):
+    t = active_trade[symbol]
+    if not t: return
+    direction = t["direction"]; entry = t["entry"]; tp=t["tp"]; sl=t["sl"]
 
-def monitor_trade(symbol, price):
-    """Target/Stop + Break-even (+0,4% entro 2 candele)."""
-    trade = active_trade[symbol]
-    if not trade:
-        return
+    # +1R?
+    risk = abs(entry-sl)
+    if not t["touched_1R"]:
+        if (direction=="LONG" and price >= entry + risk) or (direction=="SHORT" and price <= entry - risk):
+            t["touched_1R"] = True
+            send_telegram_message(f"🥇 {symbol} {direction}: +1R raggiunto")
+            if USE_PARTIAL_1R and not t["partial_done"]:
+                t["partial_done"] = True
+                send_telegram_message(f"💰 {symbol}: chiusa PARZIALE 50% a +1R (simulato)")
 
-    direction = trade["direction"]
-    tp = trade["tp"]
-    entry = trade["entry"]
+    # Trailing Chandelier dopo +1R
+    if USE_TRAILING_CH and t["touched_1R"]:
+        if len(df15) >= CH_PERIOD:
+            if direction=="LONG":
+                hh = df15["high"].tail(CH_PERIOD).max()
+                ch = hh - CH_ATR_MULT*df15["ATR"].iloc[-1]
+                t["sl"] = max(t["sl"], ch)
+            else:
+                ll = df15["low"].tail(CH_PERIOD).min()
+                ch = ll + CH_ATR_MULT*df15["ATR"].iloc[-1]
+                t["sl"] = min(t["sl"], ch)
 
-    # Break-even window
-    if not trade["moved_to_be"]:
-        elapsed = datetime.now(tz=ZoneInfo("UTC")) - trade["opened_at"]
-        within_window = elapsed <= timedelta(minutes=15*BE_WINDOW_CAND)
-        if direction == "LONG" and within_window and price >= entry * (1 + BE_TRIGGER_PCT):
-            trade["sl"] = entry
-            trade["moved_to_be"] = True
-            send_telegram_message(f"🛡️ BE attivato LONG {symbol}: SL spostato a {round(entry,2)}")
-        if direction == "SHORT" and within_window and price <= entry * (1 - BE_TRIGGER_PCT):
-            trade["sl"] = entry
-            trade["moved_to_be"] = True
-            send_telegram_message(f"🛡️ BE attivato SHORT {symbol}: SL spostato a {round(entry,2)}")
+    # Time-stop
+    if USE_TIMESTOP:
+        bars = int((datetime.now(tzUTC) - t["opened_at"]).total_seconds() // (15*60))
+        macd = df15["MACD"].iloc[-1]; sig = df15["MACD_SIGNAL"].iloc[-1]
+        macd_against = (direction=="LONG" and macd<sig) or (direction=="SHORT" and macd>sig)
+        if bars >= TIMESTOP_BARS and macd_against:
+            t["sl"] = entry
+            send_telegram_message(f"⏱️ {symbol} {direction}: time-stop → SL a BE")
 
-    # Gestione esiti
-    if direction == "LONG":
+    # Esiti
+    if direction=="LONG":
         if price >= tp:
-            send_telegram_message(f"✅ TP raggiunto LONG {symbol} a {round(tp,2)}")
-            active_trade[symbol] = None
-        elif price <= trade["sl"]:
-            send_telegram_message(f"❌ STOP colpito LONG {symbol} a {round(trade['sl'],2)}")
-            active_trade[symbol] = None
+            send_telegram_message(f"✅ TP LONG {symbol} a {round(tp,2)}")
+            log_trade([datetime.now(tzUTC),symbol,"LONG",entry,tp,t['sl'],tp,"TP",round((tp-entry)/risk,2)])
+            active_trade[symbol]=None
+            return
+        if price <= t["sl"]:
+            res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
+            send_telegram_message(f"❌ {res} LONG {symbol} a {round(t['sl'],2)}")
+            log_trade([datetime.now(tzUTC),symbol,"LONG",entry,tp,t['sl'],t['sl'],res,round((tp-entry)/risk,2)])
+            active_trade[symbol]=None
+            return
     else:
         if price <= tp:
-            send_telegram_message(f"✅ TP raggiunto SHORT {symbol} a {round(tp,2)}")
-            active_trade[symbol] = None
-        elif price >= trade["sl"]:
-            send_telegram_message(f"❌ STOP colpito SHORT {symbol} a {round(trade['sl'],2)}")
-            active_trade[symbol] = None
+            send_telegram_message(f"✅ TP SHORT {symbol} a {round(tp,2)}")
+            log_trade([datetime.now(tzUTC),symbol,"SHORT",entry,tp,t['sl'],tp,"TP",round((entry-tp)/risk,2)])
+            active_trade[symbol]=None
+            return
+        if price >= t["sl"]:
+            res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
+            send_telegram_message(f"❌ {res} SHORT {symbol} a {round(t['sl'],2)}")
+            log_trade([datetime.now(tzUTC),symbol,"SHORT",entry,tp,t['sl'],t['sl'],res,round((entry-tp)/risk,2)])
+            active_trade[symbol]=None
+            return
 
-
-def check_signal(symbol, analysis, levels):
-    """Conferma a chiusura con BUFFER + logica retest. Usa ATR in open_trade."""
+# ------------- CHECK SEGNALE -------------
+def check_signal(symbol, an, levels):
     global last_signal
-    df = build_df(symbol)
-    if df is None:
+    df = an["df"]; price = an["price"]; ema20=an["ema20"]; ema60=an["ema60"]; atr=an["atr"]
+    volume_usdt = an["volume"]; vol_thresh = VOLUME_THRESHOLDS[symbol]
+
+    if in_quiet_hours_now() and USE_VOL_FILTER:
         return
 
-    price = analysis["price"]
-    volume = analysis["volume"]
-    ema20 = analysis["ema20"]
-    ema60 = analysis["ema60"]
-    atr14 = analysis["atr"]
-    vol_thresh = VOLUME_THRESHOLDS[symbol]
+    last = df.iloc[-1]; prev=df.iloc[-2]
 
-    def valid_break(level, current_price):
-        return abs((current_price - level) / level * 100) > MIN_MOVE_PCT
-
-    last = df.iloc[-1]           # ultima candela CHIUSA
-    prev = df.iloc[-2]
+    def valid_break(level, current_price):  # legacy
+        return abs((current_price-level)/level) > MIN_MOVE_PCT
 
     def breakout_ok(level):
-        buf = level * (1 + BUFFER_PCT)
-        retest_tol = level * (1 + RETEST_TOL_PCT)
-        cond_a = last["close"] > buf and prev["close"] <= buf
-        cond_b = (last["low"] <= retest_tol) and (last["close"] > buf)
+        buf = level*(1+BUFFER_PCT); ret = level*(1+RETEST_TOL_PCT)
+        cond_a = last["close"]>buf and prev["close"]<=buf
+        cond_b = (last["low"]<=ret) and (last["close"]>buf)
         return cond_a or cond_b
 
     def breakdown_ok(level):
-        buf = level * (1 - BUFFER_PCT)
-        retest_tol = level * (1 - RETEST_TOL_PCT)
-        cond_a = last["close"] < buf and prev["close"] >= buf
-        cond_b = (last["high"] >= retest_tol) and (last["close"] < buf)
+        buf = level*(1-BUFFER_PCT); ret = level*(1-RETEST_TOL_PCT)
+        cond_a = last["close"]<buf and prev["close"]>=buf
+        cond_b = (last["high"]>=ret) and (last["close"]<buf)
         return cond_a or cond_b
 
-    # --- Breakout LONG
+    # LONG
     for level in levels["breakout"]:
-        if price >= level and ema20 > ema60 and valid_break(level, price) and breakout_ok(level):
-            if volume > vol_thresh and last_signal[symbol] != "LONG":
-                open_trade(symbol, "LONG", float(last["close"]), atr14)
-                last_signal[symbol] = "LONG"
-            elif volume <= vol_thresh:
-                send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
+        if price>=level and ema20>ema60 and valid_break(level,price) and breakout_ok(level):
+            if volume_usdt>vol_thresh and (last_signal[symbol]!="LONG"):
+                if USE_VOL_FILTER and not vol_filter(df): 
+                    send_telegram_message(f"⏭️ {symbol} LONG: vol debole")
+                    continue
+                if USE_BB_SQUEEZE and not squeeze_ok(df,"LONG"):
+                    send_telegram_message(f"⏭️ {symbol} LONG: no squeeze/banda")
+                    continue
+                if USE_MTF and not mtf_filter(symbol,"LONG"):
+                    send_telegram_message(f"⏭️ {symbol} LONG: 1h non allineato")
+                    continue
+                # ATR RR check inside
+                open_trade(symbol,"LONG", float(last["close"]), atr, rr_checked=False)
+                last_signal[symbol]="LONG"
+            elif volume_usdt<=vol_thresh:
+                send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
 
-    # --- Breakdown SHORT
+    # SHORT
     for level in levels["breakdown"]:
-        if price <= level and ema20 < ema60 and valid_break(level, price) and breakdown_ok(level):
-            if volume > vol_thresh and last_signal[symbol] != "SHORT":
-                open_trade(symbol, "SHORT", float(last["close"]), atr14)
-                last_signal[symbol] = "SHORT"
-            elif volume <= vol_thresh:
-                send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume/1e6,1)}M")
+        if price<=level and ema20<ema60 and valid_break(level,price) and breakdown_ok(level):
+            if volume_usdt>vol_thresh and (last_signal[symbol]!="SHORT"):
+                if USE_VOL_FILTER and not vol_filter(df):
+                    send_telegram_message(f"⏭️ {symbol} SHORT: vol debole")
+                    continue
+                if USE_BB_SQUEEZE and not squeeze_ok(df,"SHORT"):
+                    send_telegram_message(f"⏭️ {symbol} SHORT: no squeeze/banda")
+                    continue
+                if USE_MTF and not mtf_filter(symbol,"SHORT"):
+                    send_telegram_message(f"⏭️ {symbol} SHORT: 1h non allineato")
+                    continue
+                open_trade(symbol,"SHORT", float(last["close"]), atr, rr_checked=False)
+                last_signal[symbol]="SHORT"
+            elif volume_usdt<=vol_thresh:
+                send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
 
     # Reset segnale se neutro
     if levels["breakdown"][-1] < price < levels["breakout"][0]:
-        last_signal[symbol] = None
+        last_signal[symbol]=None
 
-
-# --- REPORT TREND ---
+# ------------- REPORT -------------
 def format_report_line(symbol, price, ema20, ema60, volume):
-    trend = "🟢" if ema20 > ema60 else "🔴" if ema20 < ema60 else "⚪"
+    trend = "🟢" if ema20>ema60 else "🔴" if ema20<ema60 else "⚪"
     return f"{trend} {symbol}: {round(price,2)}$ | EMA20:{round(ema20,2)} | EMA60:{round(ema60,2)} | Vol:{round(volume/1e6,1)}M"
 
-
 def build_suggestion(btc_trend, eth_trend):
-    if btc_trend == "🟢" and eth_trend == "🟢":
-        return "Suggerimento: Preferenza LONG ✅"
-    elif btc_trend == "🔴" and eth_trend == "🔴":
-        return "Suggerimento: Preferenza SHORT ❌"
-    else:
-        return "Suggerimento: Trend misto – Attendere conferma ⚠️"
+    if btc_trend=="🟢" and eth_trend=="🟢": return "Suggerimento: Preferenza LONG ✅"
+    if btc_trend=="🔴" and eth_trend=="🔴": return "Suggerimento: Preferenza SHORT ❌"
+    return "Suggerimento: Trend misto – Attendere conferma ⚠️"
 
+def maybe_send_daily_report():
+    # 23:59 Italia
+    now_it = datetime.now(tzIT)
+    hh, mm = DAILY_REPORT_IT_HM
+    if now_it.strftime("%H")==hh and now_it.strftime("%M")==mm:
+        if os.path.exists(TRADES_CSV):
+            try:
+                df = pd.read_csv(TRADES_CSV)
+                today = date.today().isoformat()
+                df["time_utc"] = pd.to_datetime(df["time_utc"])
+                today_df = df[df["time_utc"].dt.date.astype(str)==today]
+                if len(today_df):
+                    wr = (today_df["result"]=="TP").mean()
+                    msg = f"📊 Daily report {today}: trades {len(today_df)}, win-rate {wr*100:.0f}%, R medio ≈ {today_df['rr'].mean():.2f}"
+                else:
+                    msg = f"📊 Daily report {today}: nessun trade."
+                send_telegram_message(msg)
+            except Exception as e:
+                print("daily report err:", e)
 
-# --- MAIN LOOP ---
+# ------------- MAIN LOOP -------------
 if __name__ == "__main__":
-    # Messaggio iniziale SOLO una volta ogni 12 ore
     send_startup_once()
-
     while True:
-        now_it = datetime.now(tz=ZoneInfo("Europe/Rome")).strftime("%H:%M")
-        now_utc = datetime.now(tz=ZoneInfo("UTC")).strftime("%H:%M")
+        now_it  = datetime.now(tzIT).strftime("%H:%M")
+        now_utc = datetime.now(tzUTC).strftime("%H:%M")
         report_msg = f"🕒 Report {now_it} (Italia) | {now_utc} UTC\n"
-
         trends = {}
 
-        for symbol in ["BTC", "ETH"]:
-            analysis = analyze(symbol)
-            if analysis:
-                price  = analysis["price"]
-                volume = analysis["volume"]
-                ema20  = analysis["ema20"]
-                ema60  = analysis["ema60"]
-
-                # Controlla segnali con nuove regole robuste
-                check_signal(symbol, analysis, LEVELS[symbol])
-
-                # Monitora eventuale trade aperto (TP/SL + break-even)
-                monitor_trade(symbol, price)
-
-                # Aggiungi trend
-                trend_emoji = "🟢" if ema20 > ema60 else "🔴" if ema20 < ema60 else "⚪"
-                trends[symbol] = trend_emoji
-
-                report_msg += f"\n{format_report_line(symbol, price, ema20, ema60, volume)}"
+        for symbol in ["BTC","ETH"]:
+            an = analyze(symbol)
+            if an:
+                price, vol, ema20, ema60 = an["price"], an["volume"], an["ema20"], an["ema60"]
+                check_signal(symbol, an, LEVELS[symbol])
+                monitor_trade(symbol, price, an["df"])
+                trends[symbol] = "🟢" if ema20>ema60 else "🔴" if ema20<ema60 else "⚪"
+                report_msg += f"\n{format_report_line(symbol, price, ema20, ema60, vol)}"
             else:
-                report_msg += f"\n{symbol}: Errore dati"
-                trends[symbol] = "⚪"
+                report_msg += f"\n{symbol}: Errore dati"; trends[symbol]="⚪"
 
         report_msg += f"\n\n{build_suggestion(trends['BTC'], trends['ETH'])}"
         send_telegram_message(report_msg)
 
-        time.sleep(1800)  # Report ogni 30 min
+        maybe_send_daily_report()
+        time.sleep(1800)  # ogni 30 minuti

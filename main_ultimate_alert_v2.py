@@ -22,7 +22,8 @@ LEVELS = {
 
 VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT nominali
 MIN_MOVE_PCT = 0.2   # % minima di superamento livello (residuo della tua logica)
-# --- Nuovi parametri robustezza ---
+
+# --- Parametri robustezza ---
 BUFFER_PCT      = 0.0005  # 0.05%: chiusura oltre livello per conferma
 RETEST_TOL_PCT  = 0.0002  # 0.02%: tolleranza di retest sul livello
 ATR_PERIOD      = 14
@@ -36,7 +37,7 @@ KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval=15m
 
 # Stato segnali
 last_signal  = {"BTC": None, "ETH": None}
-active_trade = {"BTC": None, "ETH": None}  # Salva target e stop e metadata
+active_trade = {"BTC": None, "ETH": None}  # Salva target/stop/metadata
 
 # Startup flag per evitare messaggi ripetuti a ogni riavvio
 STARTUP_FLAG = "/tmp/bot_startup_flag.txt"
@@ -87,14 +88,13 @@ def calc_ema(prices, period):
     return ema
 
 
+# ========== FIX ROBUSTA KLINES (8 o 12 colonne) + INDICATORI ==========
 def build_df(symbol):
     """
     Restituisce DataFrame 15m con OHLCV e indicatori base + ATR.
-    Tollerante: supporta sia klines con 12 campi (standard MEXC) sia con 8 campi.
-    Non crascia se l'API risponde con errori/limiti.
+    Tollerante: supporta sia klines a 12 campi (standard MEXC) sia a 8 campi.
     """
     data = get_klines(symbol)
-    # Sanity check: data deve essere lista di liste
     if not isinstance(data, list) or (len(data) and not isinstance(data[0], (list, tuple))):
         print(f"[WARN] Risposta inattesa MEXC per {symbol}: {str(data)[:120]}")
         send_telegram_message(f"⚠️ Dati {symbol} temporaneamente non disponibili (API). Riprovo…")
@@ -103,23 +103,16 @@ def build_df(symbol):
         print(f"[WARN] Nessun dato kline per {symbol}")
         return None
 
-    # Normalizza le righe in un formato coerente
     rows = []
     for r in data:
-        # Formato 12 campi MEXC classico:
-        # [open_time, open, high, low, close, volume, close_time, quote_vol,
-        #  trades, taker_buy_base, taker_buy_quote, ignore]
         if len(r) >= 12:
             open_time, open_, high, low, close, volume, close_time, quote_vol, trades, tb_base, tb_quote, *_ = r
-        # Formato “ridotto” 8 campi (alcuni edge case dell’API):
-        # [open_time, open, high, low, close, volume, close_time, quote_vol]
         elif len(r) >= 8:
             open_time, open_, high, low, close, volume, close_time, quote_vol = r[:8]
             trades = 0
             tb_base = 0.0
             tb_quote = 0.0
         else:
-            # Riga corrotta: salto
             continue
 
         rows.append({
@@ -149,7 +142,7 @@ def build_df(symbol):
         (df["high"] - prev_close).abs(),
         (df["low"]  - prev_close).abs()
     ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean().fillna(method="bfill")
+    df["ATR"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean().bfill()
 
     # --- MACD (12,26,9)
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
@@ -161,13 +154,14 @@ def build_df(symbol):
     # --- KDJ (9,3,3)
     low_min = df["low"].rolling(window=9, min_periods=9).min()
     high_max = df["high"].rolling(window=9, min_periods=9).max()
-    rsv = (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
+    denom = (high_max - low_min).replace(0, np.nan)
+    rsv = (df["close"] - low_min) / denom * 100
     df["K"] = rsv.ewm(com=2, adjust=False).mean()
     df["D"] = df["K"].ewm(com=2, adjust=False).mean()
     df["J"] = 3 * df["K"] - 2 * df["D"]
 
     return df
-
+# ======================================================================
 
 
 # === GRAFICO + NOTIFICA ottimizzata ===
@@ -287,7 +281,6 @@ def analyze(symbol):
 # --- TRADE MANAGEMENT ---
 def open_trade(symbol, direction, entry_price, atr):
     """ATR-based TP/SL + R/R minimo + metadata per break-even."""
-    # Calcolo SL/TP dinamici con ATR
     if direction == "LONG":
         sl = entry_price - ATR_SL_MULT * atr
         tp = entry_price + ATR_TP_MULT * atr
@@ -324,7 +317,6 @@ def monitor_trade(symbol, price):
 
     direction = trade["direction"]
     tp = trade["tp"]
-    sl = trade["sl"]
     entry = trade["entry"]
 
     # Break-even window
@@ -377,13 +369,10 @@ def check_signal(symbol, analysis, levels):
     last = df.iloc[-1]           # ultima candela CHIUSA
     prev = df.iloc[-2]
 
-    # Helper: condizioni di buffer e retest su breakout/breakdown
     def breakout_ok(level):
         buf = level * (1 + BUFFER_PCT)
         retest_tol = level * (1 + RETEST_TOL_PCT)
-        # (A) chiusura sopra buffer
         cond_a = last["close"] > buf and prev["close"] <= buf
-        # (B) retest: candela attuale ha fatto low <= livello (tolleranza) ma chiude sopra buffer
         cond_b = (last["low"] <= retest_tol) and (last["close"] > buf)
         return cond_a or cond_b
 

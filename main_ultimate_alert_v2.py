@@ -88,46 +88,86 @@ def calc_ema(prices, period):
 
 
 def build_df(symbol):
-    """Restituisce DataFrame 15m con OHLCV e indicatori base + ATR."""
+    """
+    Restituisce DataFrame 15m con OHLCV e indicatori base + ATR.
+    Tollerante: supporta sia klines con 12 campi (standard MEXC) sia con 8 campi.
+    Non crascia se l'API risponde con errori/limiti.
+    """
     data = get_klines(symbol)
-    if not data:
+    # Sanity check: data deve essere lista di liste
+    if not isinstance(data, list) or (len(data) and not isinstance(data[0], (list, tuple))):
+        print(f"[WARN] Risposta inattesa MEXC per {symbol}: {str(data)[:120]}")
+        send_telegram_message(f"⚠️ Dati {symbol} temporaneamente non disponibili (API). Riprovo…")
         return None
-    cols = ["open_time","open","high","low","close","volume",
-            "close_time","qvol","trades","tb_base","tb_quote","ignore"]
-    df = pd.DataFrame(data, columns=cols)
-    df["open"]  = df["open"].astype(float)
-    df["high"]  = df["high"].astype(float)
-    df["low"]   = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["volume"]= df["volume"].astype(float)
-    df["open_time"]  = pd.to_datetime(df["open_time"], unit="ms")
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+    if not data:
+        print(f"[WARN] Nessun dato kline per {symbol}")
+        return None
 
-    # ATR
+    # Normalizza le righe in un formato coerente
+    rows = []
+    for r in data:
+        # Formato 12 campi MEXC classico:
+        # [open_time, open, high, low, close, volume, close_time, quote_vol,
+        #  trades, taker_buy_base, taker_buy_quote, ignore]
+        if len(r) >= 12:
+            open_time, open_, high, low, close, volume, close_time, quote_vol, trades, tb_base, tb_quote, *_ = r
+        # Formato “ridotto” 8 campi (alcuni edge case dell’API):
+        # [open_time, open, high, low, close, volume, close_time, quote_vol]
+        elif len(r) >= 8:
+            open_time, open_, high, low, close, volume, close_time, quote_vol = r[:8]
+            trades = 0
+            tb_base = 0.0
+            tb_quote = 0.0
+        else:
+            # Riga corrotta: salto
+            continue
+
+        rows.append({
+            "open_time":   pd.to_datetime(int(open_time), unit="ms"),
+            "open":        float(open_),
+            "high":        float(high),
+            "low":         float(low),
+            "close":       float(close),
+            "volume":      float(volume),
+            "close_time":  pd.to_datetime(int(close_time), unit="ms"),
+            "quote_vol":   float(quote_vol) if quote_vol is not None else 0.0,
+            "trades":      int(trades) if trades is not None else 0,
+            "tb_base":     float(tb_base),
+            "tb_quote":    float(tb_quote),
+        })
+
+    if not rows:
+        print(f"[WARN] Tutte le righe scartate per {symbol}")
+        return None
+
+    df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
+
+    # --- ATR (14)
     prev_close = df["close"].shift(1)
     tr = pd.concat([
         (df["high"] - df["low"]).abs(),
         (df["high"] - prev_close).abs(),
         (df["low"]  - prev_close).abs()
     ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(ATR_PERIOD).mean()
+    df["ATR"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean().fillna(method="bfill")
 
-    # MACD
+    # --- MACD (12,26,9)
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    # KDJ
-    low_min = df["low"].rolling(window=9).min()
-    high_max = df["high"].rolling(window=9).max()
-    rsv = (df["close"] - low_min) / (high_max - low_min) * 100
-    df["K"] = rsv.ewm(com=2).mean()
-    df["D"] = df["K"].ewm(com=2).mean()
-    df["J"] = 3*df["K"] - 2*df["D"]
+    # --- KDJ (9,3,3)
+    low_min = df["low"].rolling(window=9, min_periods=9).min()
+    high_max = df["high"].rolling(window=9, min_periods=9).max()
+    rsv = (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan) * 100
+    df["K"] = rsv.ewm(com=2, adjust=False).mean()
+    df["D"] = df["K"].ewm(com=2, adjust=False).mean()
+    df["J"] = 3 * df["K"] - 2 * df["D"]
 
     return df
+
 
 
 # === GRAFICO + NOTIFICA ottimizzata ===

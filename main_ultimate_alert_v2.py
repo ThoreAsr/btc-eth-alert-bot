@@ -53,13 +53,19 @@ BUFFER_PCT     = 0.05/100
 RETEST_TOL_PCT = 0.02/100
 
 # === Precision Pack toggles ===
-USE_MTF            = True   # filtro 1h
-USE_VOL_FILTER     = True   # vol 15m > 1.2× mediana 20
+USE_MTF            = True    # filtro 1h
+USE_MTF_4H         = True    # 4h non deve essere contro trend (opzionale)
+USE_VOL_FILTER     = True    # vol 15m > 1.2× mediana 20
 VOL_MULT           = 1.2
-QUIET_HOURS_UTC    = [(0,3)]  # no trade tra 00:00–03:59 UTC
-USE_BB_SQUEEZE     = True   # breakout dopo squeeze + close oltre banda
+QUIET_HOURS_UTC    = [(0,3)] # no trade tra 00:00–03:59 UTC
+USE_BB_SQUEEZE     = True    # breakout dopo squeeze + close oltre banda
 BB_WINDOW          = 20
-BB_SQ_THRESHOLD    = 0.06   # (upper-lower)/mid < 6%
+BB_SQ_THRESHOLD    = 0.06    # (upper-lower)/mid < 6%
+
+# Filtro volatilità avanzato (salta segnali con ATR troppo basso)
+USE_ATR_VOL_FILTER = True
+ATR_VOL_MIN_PCT    = 0.35/100   # ATR/close ≥ 0.35%
+
 USE_PARTIAL_1R     = True   # chiusura 50% a +1R
 USE_TRAILING_CH    = True   # trailing chandelier dopo +1R
 CH_PERIOD          = 22
@@ -69,7 +75,7 @@ TIMESTOP_BARS      = 8
 
 # === Modalità "AGGRESSIVO" (nuova) ===
 USE_AGGR             = True
-AGGR_VOL_MULT        = 1.5      # volume >= 1.5× mediana 20
+AGGR_VOL_MULT        = 1.5      # volume ≥ 1.5× mediana 20
 AGGR_BUFFER_PCT      = 0.20/100 # chiusura oltre livello di 0.20%
 AGGR_MIN_CONFLUENCE  = 2        # min 2 condizioni favorevoli (EMA, MACD, K-D)
 AGGR_REQUIRE_RR      = False    # ignora R/R minimo (True per richiederlo)
@@ -116,7 +122,7 @@ def send_startup_once():
                 ts = float((f.read() or "0").strip())
             if time.time() - ts < STARTUP_COOLDOWN_SEC:
                 return
-        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 + Aggressive Mode")
+        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 + Aggressive Mode + Volatility Filter")
         with open(STARTUP_FLAG,"w") as f:
             f.write(str(time.time()))
     except Exception as e:
@@ -268,11 +274,28 @@ def in_quiet_hours_now():
     return False
 
 def mtf_filter(symbol, direction):
-    if not USE_MTF: return True
+    """Richiede 1h allineato e (se attivo) 4h non opposto."""
+    if not USE_MTF: 
+        return True
     df1h = build_df(symbol, "1h", 300)
-    if df1h is None or len(df1h) < 200: return True
-    ema50, ema200 = df1h["EMA50"].iloc[-1], df1h["EMA200"].iloc[-1]
-    return (direction=="LONG" and ema50>ema200) or (direction=="SHORT" and ema50<ema200)
+    if df1h is None or len(df1h) < 200:
+        ok1h = True
+    else:
+        ema50_1h, ema200_1h = df1h["EMA50"].iloc[-1], df1h["EMA200"].iloc[-1]
+        ok1h = (direction=="LONG" and ema50_1h>ema200_1h) or (direction=="SHORT" and ema50_1h<ema200_1h)
+
+    if not USE_MTF_4H:
+        return ok1h
+
+    df4h = build_df(symbol, "4h", 300)
+    if df4h is None or len(df4h) < 200:
+        ok4h = True
+    else:
+        ema50_4h, ema200_4h = df4h["EMA50"].iloc[-1], df4h["EMA200"].iloc[-1]
+        # 4h non deve essere contro netto
+        ok4h = not ((direction=="LONG" and ema50_4h<ema200_4h) or (direction=="SHORT" and ema50_4h>ema200_4h))
+
+    return ok1h and ok4h
 
 def vol_filter(df15):
     if not USE_VOL_FILTER: return True
@@ -284,6 +307,14 @@ def aggr_vol_ok(df15):
     v = df15["volume"].iloc[-1]
     med = df15["volume"].tail(20).median()
     return v >= AGGR_VOL_MULT*med
+
+def atr_vol_ok(df15):
+    """ATR/close deve essere >= soglia per evitare mercato troppo piatto."""
+    if not USE_ATR_VOL_FILTER: 
+        return True
+    atr = df15["ATR"].iloc[-1]
+    close = df15["close"].iloc[-1]
+    return (atr / max(close,1e-9)) >= ATR_VOL_MIN_PCT
 
 def squeeze_ok(df15, direction):
     if not USE_BB_SQUEEZE: return True
@@ -434,45 +465,49 @@ def check_signal(symbol, an, levels):
         cond_b = (last["high"]>=ret) and (last["close"]<buf)
         return cond_a or cond_b
 
-    # ====== SICURO (come prima) ======
-    # LONG
+    # ====== SICURO ======
+    # Long
     for level in levels["breakout"]:
         if price>=level and ema20>ema60 and valid_break(level,price) and breakout_ok(level):
             if volume_usdt>vol_thresh and (last_signal[symbol]!="LONG"):
+                if USE_ATR_VOL_FILTER and not atr_vol_ok(df): 
+                    send_telegram_message(f"⏭️ {symbol} LONG: volatilità troppo bassa"); continue
                 if USE_VOL_FILTER and not vol_filter(df): 
                     send_telegram_message(f"⏭️ {symbol} LONG: vol debole"); continue
                 if USE_BB_SQUEEZE and not squeeze_ok(df,"LONG"):
                     send_telegram_message(f"⏭️ {symbol} LONG: no squeeze/banda"); continue
-                if USE_MTF and not mtf_filter(symbol,"LONG"):
-                    send_telegram_message(f"⏭️ {symbol} LONG: 1h non allineato"); continue
+                if not mtf_filter(symbol,"LONG"):
+                    send_telegram_message(f"⏭️ {symbol} LONG: MTF non allineato"); continue
                 open_trade(symbol,"LONG", float(last["close"]), atr, kind="SAFE", rr_checked=False)
                 last_signal[symbol]="LONG"; last_signal_type[symbol]="SAFE"
             elif volume_usdt<=vol_thresh:
                 send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
 
-    # SHORT
+    # Short
     for level in levels["breakdown"]:
         if price<=level and ema20<ema60 and valid_break(level,price) and breakdown_ok(level):
             if volume_usdt>vol_thresh and (last_signal[symbol]!="SHORT"):
+                if USE_ATR_VOL_FILTER and not atr_vol_ok(df): 
+                    send_telegram_message(f"⏭️ {symbol} SHORT: volatilità troppo bassa"); continue
                 if USE_VOL_FILTER and not vol_filter(df):
                     send_telegram_message(f"⏭️ {symbol} SHORT: vol debole"); continue
                 if USE_BB_SQUEEZE and not squeeze_ok(df,"SHORT"):
                     send_telegram_message(f"⏭️ {symbol} SHORT: no squeeze/banda"); continue
-                if USE_MTF and not mtf_filter(symbol,"SHORT"):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: 1h non allineato"); continue
+                if not mtf_filter(symbol,"SHORT"):
+                    send_telegram_message(f"⏭️ {symbol} SHORT: MTF non allineato"); continue
                 open_trade(symbol,"SHORT", float(last["close"]), atr, kind="SAFE", rr_checked=False)
                 last_signal[symbol]="SHORT"; last_signal_type[symbol]="SAFE"
             elif volume_usdt<=vol_thresh:
                 send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
 
-    # ====== AGGRESSIVO (nuovo) ======
+    # ====== AGGRESSIVO ======
     if USE_AGGR and active_trade[symbol] is None:
         # LONG aggressivo
         for level in levels["breakout"]:
             buf_aggr = level*(1+AGGR_BUFFER_PCT)
             if (last["close"]>buf_aggr and ema20>=ema60 and valid_break(level, price)):
                 if aggr_vol_ok(df) and confluence_score(df,"LONG") >= AGGR_MIN_CONFLUENCE:
-                    # MTF/squeeze/rr possono essere mancanti → segnaliamo lo stesso
+                    # MTF/squeeze/rr possono mancare → segnaliamo lo stesso
                     rr_needed = AGGR_REQUIRE_RR
                     open_trade(symbol,"LONG", float(last["close"]), atr, kind="AGGR", rr_checked=rr_needed)
                     last_signal[symbol]="LONG"; last_signal_type[symbol]="AGGR"

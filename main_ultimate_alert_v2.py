@@ -12,7 +12,7 @@ import matplotlib.dates as mdates
 import pandas as pd
 import numpy as np
 
-# ---------- FUNZIONI BASE MANCANTI (aggiunta) ----------
+# ---------- FUNZIONI BASE ----------
 def calc_ema(data, period):
     """Calcola una EMA semplice su una lista di prezzi."""
     if not data:
@@ -24,7 +24,7 @@ def calc_ema(data, period):
     for price in data[1:]:
         ema = price * k + ema * (1 - k)
     return ema
-# -------------------------------------------------------
+# -----------------------------------
 
 # ================== CONFIG ==================
 TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
@@ -48,7 +48,7 @@ MIN_RR       = 1.5
 BE_TRIGGER   = 0.004      # +0.4%
 BE_WINDOW    = 2          # candele 15m
 
-# Buffer/Retest
+# Buffer/Retest (SICURO)
 BUFFER_PCT     = 0.05/100
 RETEST_TOL_PCT = 0.02/100
 
@@ -59,13 +59,20 @@ VOL_MULT           = 1.2
 QUIET_HOURS_UTC    = [(0,3)]  # no trade tra 00:00–03:59 UTC
 USE_BB_SQUEEZE     = True   # breakout dopo squeeze + close oltre banda
 BB_WINDOW          = 20
-BB_SQ_THRESHOLD    = 0.06   # banda stretta: (upper-lower)/mid < 0.06 (~6%)
+BB_SQ_THRESHOLD    = 0.06   # (upper-lower)/mid < 6%
 USE_PARTIAL_1R     = True   # chiusura 50% a +1R
 USE_TRAILING_CH    = True   # trailing chandelier dopo +1R
 CH_PERIOD          = 22
 CH_ATR_MULT        = 2.5
 USE_TIMESTOP       = True   # esci a BE se dopo 8 barre MACD contro
 TIMESTOP_BARS      = 8
+
+# === Modalità "AGGRESSIVO" (nuova) ===
+USE_AGGR             = True
+AGGR_VOL_MULT        = 1.5      # volume >= 1.5× mediana 20
+AGGR_BUFFER_PCT      = 0.20/100 # chiusura oltre livello di 0.20%
+AGGR_MIN_CONFLUENCE  = 2        # min 2 condizioni favorevoli (EMA, MACD, K-D)
+AGGR_REQUIRE_RR      = False    # ignora R/R minimo (True per richiederlo)
 
 # Report giornaliero
 DAILY_REPORT_IT_HM = ("23","59")  # Italia
@@ -74,8 +81,9 @@ DAILY_REPORT_IT_HM = ("23","59")  # Italia
 KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
 
 # Stato segnali
-last_signal  = {"BTC": None, "ETH": None}
-active_trade = {"BTC": None, "ETH": None}
+last_signal      = {"BTC": None, "ETH": None}
+last_signal_type = {"BTC": None, "ETH": None}  # "SAFE" o "AGGR"
+active_trade     = {"BTC": None, "ETH": None}
 
 # Startup flag 12h
 STARTUP_FLAG = "/tmp/bot_startup_flag.txt"
@@ -108,7 +116,7 @@ def send_startup_once():
                 ts = float((f.read() or "0").strip())
             if time.time() - ts < STARTUP_COOLDOWN_SEC:
                 return
-        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 (MTF, Vol, Squeeze, Parziale+Trailing, Time-stop)")
+        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 + Aggressive Mode")
         with open(STARTUP_FLAG,"w") as f:
             f.write(str(time.time()))
     except Exception as e:
@@ -189,7 +197,7 @@ def build_df(symbol, interval="15m", limit=120):
     return df
 
 # ------------- NOTIFICA + GRAFICO -------------
-def build_chart_for(symbol, entry, tp, sl):
+def build_chart_for(symbol, entry, tp, sl, kind="SAFE"):
     df = build_df(symbol, "15m", 120)
     if df is None: raise RuntimeError("No data")
 
@@ -197,15 +205,24 @@ def build_chart_for(symbol, entry, tp, sl):
                                         gridspec_kw={'height_ratios':[3,1,1]})
     ax1.plot(df["close_time"], df["close"], label=f"{symbol}/USDT")
     ax1.grid(True, linewidth=0.4)
-    ax1.axhline(entry, color="#16a34a", linestyle="--",      linewidth=2.2, label="Entrata")
-    ax1.axhline(tp,    color="#f59e0b", linestyle=(0,(9,4)), linewidth=2.2, label="Target")
-    ax1.axhline(sl,    color="#ef4444", linestyle=(0,(3,3)), linewidth=2.2, label="Stop")
+
+    # palette per tipo segnale
+    if kind == "SAFE":
+        c_entry, c_tp, c_sl = "#16a34a", "#f59e0b", "#ef4444"      # verde / arancio / rosso
+    else:
+        c_entry, c_tp, c_sl = "#06b6d4", "#8b5cf6", "#64748b"      # ciano / viola / grigio
+
+    ax1.axhline(entry, color=c_entry, linestyle="--",      linewidth=2.2, label="Entrata")
+    ax1.axhline(tp,    color=c_tp,    linestyle=(0,(9,4)), linewidth=2.2, label="Target")
+    ax1.axhline(sl,    color=c_sl,    linestyle=(0,(3,3)), linewidth=2.2, label="Stop")
+
     def annotate(y, text, c):
         ax1.text(df["close_time"].iloc[-1], y, f"  {text}", color=c,
                  va="center", fontsize=10, bbox=dict(facecolor="white", alpha=0.7, edgecolor=c))
-    annotate(entry, f"Entrata {round(entry,2)}", "#16a34a")
-    annotate(tp,    f"Target {round(tp,2)}",     "#f59e0b")
-    annotate(sl,    f"Stop {round(sl,2)}",       "#ef4444")
+    annotate(entry, f"Entrata {round(entry,2)}", c_entry)
+    annotate(tp,    f"Target {round(tp,2)}",     c_tp)
+    annotate(sl,    f"Stop {round(sl,2)}",       c_sl)
+
     ax1.set_ylabel("USDT"); ax1.legend(loc="upper left")
 
     colors = np.where(df["MACD_HIST"]>=0, "#16a34a", "#ef4444")
@@ -225,11 +242,20 @@ def build_chart_for(symbol, entry, tp, sl):
     plt.close(fig); buf.seek(0)
     return buf.getvalue()
 
-def notify_signal(symbol, direction, entry, tp, sl):
-    send_telegram_message(f"🚨 {direction} {symbol} 15m | Ingresso {round(entry,2)}")
-    send_telegram_message(f"🎯 Target: {round(tp,2)}   🛑 Stop: {round(sl,2)}\n⏱️ TF: 15m   📊 Vol: auto\nEntra solo se sei operativo.")
+def notify_signal(symbol, direction, entry, tp, sl, kind="SAFE", rr=None):
+    if kind == "SAFE":
+        title = f"✅ ENTRATA SICURA {direction} {symbol} 15m | Ingresso {round(entry,2)}"
+        note  = "✔️ Tutte le conferme attive"
+    else:
+        title = f"🚀 BREAKOUT AGGRESSIVO {direction} {symbol} 15m | Ingresso {round(entry,2)}"
+        note  = "⚠️ Segnale ad alto rischio (conferme parziali)"
+
+    send_telegram_message(title)
+    rr_txt = f" | R/R ≈ {rr:.2f}" if rr is not None else ""
+    send_telegram_message(f"🎯 Target: {round(tp,2)}   🛑 Stop: {round(sl,2)}{rr_txt}\n⏱️ TF: 15m   {note}")
+
     try:
-        send_photo(build_chart_for(symbol, entry, tp, sl), "📸 Grafico 15m con MACD & KDJ")
+        send_photo(build_chart_for(symbol, entry, tp, sl, kind), f"📸 Grafico 15m ({'Sicuro' if kind=='SAFE' else 'Aggressivo'})")
     except Exception as e:
         print("chart err:", e)
 
@@ -254,6 +280,11 @@ def vol_filter(df15):
     med = df15["volume"].tail(20).median()
     return v > VOL_MULT*med
 
+def aggr_vol_ok(df15):
+    v = df15["volume"].iloc[-1]
+    med = df15["volume"].tail(20).median()
+    return v >= AGGR_VOL_MULT*med
+
 def squeeze_ok(df15, direction):
     if not USE_BB_SQUEEZE: return True
     last = df15.iloc[-1]
@@ -270,8 +301,16 @@ def rr_ok(entry, tp, sl):
     rr = reward/max(risk,1e-9)
     return rr >= MIN_RR, rr
 
+def confluence_score(df15, direction):
+    """Conta quante condizioni favorevoli abbiamo adesso (per Aggressivo)."""
+    last = df15.iloc[-1]
+    ema_ok  = (last["EMA50"] > last["EMA200"]) if direction=="LONG" else (last["EMA50"] < last["EMA200"])
+    macd_ok = (last["MACD"] > last["MACD_SIGNAL"]) if direction=="LONG" else (last["MACD"] < last["MACD_SIGNAL"])
+    kd_ok   = (last["K"] > last["D"]) if direction=="LONG" else (last["K"] < last["D"])
+    return sum([ema_ok, macd_ok, kd_ok])
+
 def log_trade(row):
-    header = ["time_utc","symbol","direction","entry","tp","sl","exit_price","result","rr"]
+    header = ["time_utc","symbol","direction","kind","entry","tp","sl","exit_price","result","rr"]
     exists = os.path.exists(TRADES_CSV)
     with open(TRADES_CSV,"a",newline="") as f:
         w=csv.writer(f)
@@ -293,7 +332,7 @@ def analyze(symbol):
     atr14 = df["ATR"].iloc[-1]
     return {"price": last_close, "volume": last_vol, "ema20": ema20, "ema60": ema60, "atr": atr14, "df": df}
 
-def open_trade(symbol, direction, entry_price, atr, rr_checked=True):
+def open_trade(symbol, direction, entry_price, atr, kind="SAFE", rr_checked=True):
     if direction=="LONG":
         sl = entry_price - ATR_SL_MULT*atr
         tp = entry_price + ATR_TP_MULT*atr
@@ -301,30 +340,30 @@ def open_trade(symbol, direction, entry_price, atr, rr_checked=True):
         sl = entry_price + ATR_SL_MULT*atr
         tp = entry_price - ATR_TP_MULT*atr
 
-    ok, rr = (True, None)
+    rr_ok_flag, rr_val = True, None
     if not rr_checked:
-        ok, rr = rr_ok(entry_price, tp, sl)
-        if not ok:
-            send_telegram_message(f"⏭️ {symbol} {direction}: R/R {rr:.2f} < {MIN_RR}, skip")
+        rr_ok_flag, rr_val = rr_ok(entry_price, tp, sl)
+        if not rr_ok_flag:
+            send_telegram_message(f"⏭️ {symbol} {direction}: R/R {rr_val:.2f} < {MIN_RR}, skip")
             return
 
     active_trade[symbol] = {
         "direction": direction, "entry": entry_price, "tp": tp, "sl": sl,
         "opened_at": datetime.now(tzUTC), "moved_to_be": False,
-        "t0_idx": None, "touched_1R": False, "partial_done": False
+        "touched_1R": False, "partial_done": False, "kind": kind
     }
-    notify_signal(symbol, direction, entry_price, tp, sl)
+    notify_signal(symbol, direction, entry_price, tp, sl, kind, rr_val)
 
 def monitor_trade(symbol, price, df15):
     t = active_trade[symbol]
     if not t: return
-    direction = t["direction"]; entry = t["entry"]; tp=t["tp"]; sl=t["sl"]
+    direction = t["direction"]; entry = t["entry"]; tp=t["tp"]; sl=t["sl"]; kind=t["kind"]
 
     risk = abs(entry-sl)
     if not t["touched_1R"]:
         if (direction=="LONG" and price >= entry + risk) or (direction=="SHORT" and price <= entry - risk):
             t["touched_1R"] = True
-            send_telegram_message(f"🥇 {symbol} {direction}: +1R raggiunto")
+            send_telegram_message(f"🥇 {symbol} {direction} ({kind}): +1R raggiunto")
             if USE_PARTIAL_1R and not t["partial_done"]:
                 t["partial_done"] = True
                 send_telegram_message(f"💰 {symbol}: chiusa PARZIALE 50% a +1R (simulato)")
@@ -346,32 +385,32 @@ def monitor_trade(symbol, price, df15):
         macd_against = (direction=="LONG" and macd<sig) or (direction=="SHORT" and macd>sig)
         if bars >= TIMESTOP_BARS and macd_against:
             t["sl"] = entry
-            send_telegram_message(f"⏱️ {symbol} {direction}: time-stop → SL a BE")
+            send_telegram_message(f"⏱️ {symbol} {direction} ({kind}): time-stop → SL a BE")
 
     if direction=="LONG":
         if price >= tp:
-            send_telegram_message(f"✅ TP LONG {symbol} a {round(tp,2)}")
-            log_trade([datetime.now(tzUTC),symbol,"LONG",entry,tp,t['sl'],tp,"TP",round((tp-entry)/risk,2)])
+            send_telegram_message(f"✅ TP LONG {symbol} ({kind}) a {round(tp,2)}")
+            log_trade([datetime.now(tzUTC),symbol,"LONG",kind,entry,tp,t['sl'],tp,"TP",round((tp-entry)/risk,2)])
             active_trade[symbol]=None; return
         if price <= t["sl"]:
             res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
-            send_telegram_message(f"❌ {res} LONG {symbol} a {round(t['sl'],2)}")
-            log_trade([datetime.now(tzUTC),symbol,"LONG",entry,tp,t['sl'],t['sl'],res,round((tp-entry)/risk,2)])
+            send_telegram_message(f"❌ {res} LONG {symbol} ({kind}) a {round(t['sl'],2)}")
+            log_trade([datetime.now(tzUTC),symbol,"LONG",kind,entry,tp,t['sl'],t['sl'],res,round((tp-entry)/risk,2)])
             active_trade[symbol]=None; return
     else:
         if price <= tp:
-            send_telegram_message(f"✅ TP SHORT {symbol} a {round(tp,2)}")
-            log_trade([datetime.now(tzUTC),symbol,"SHORT",entry,tp,t['sl'],tp,"TP",round((entry-tp)/risk,2)])
+            send_telegram_message(f"✅ TP SHORT {symbol} ({kind}) a {round(tp,2)}")
+            log_trade([datetime.now(tzUTC),symbol,"SHORT",kind,entry,tp,t['sl'],tp,"TP",round((entry-tp)/risk,2)])
             active_trade[symbol]=None; return
         if price >= t["sl"]:
             res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
-            send_telegram_message(f"❌ {res} SHORT {symbol} a {round(t['sl'],2)}")
-            log_trade([datetime.now(tzUTC),symbol,"SHORT",entry,tp,t['sl'],t['sl'],res,round((entry-tp)/risk,2)])
+            send_telegram_message(f"❌ {res} SHORT {symbol} ({kind}) a {round(t['sl'],2)}")
+            log_trade([datetime.now(tzUTC),symbol,"SHORT",kind,entry,tp,t['sl'],t['sl'],res,round((entry-tp)/risk,2)])
             active_trade[symbol]=None; return
 
 # ------------- CHECK SEGNALE -------------
 def check_signal(symbol, an, levels):
-    global last_signal
+    global last_signal, last_signal_type
     df = an["df"]; price = an["price"]; ema20=an["ema20"]; ema60=an["ema60"]; atr=an["atr"]
     volume_usdt = an["volume"]; vol_thresh = VOLUME_THRESHOLDS[symbol]
 
@@ -395,6 +434,7 @@ def check_signal(symbol, an, levels):
         cond_b = (last["high"]>=ret) and (last["close"]<buf)
         return cond_a or cond_b
 
+    # ====== SICURO (come prima) ======
     # LONG
     for level in levels["breakout"]:
         if price>=level and ema20>ema60 and valid_break(level,price) and breakout_ok(level):
@@ -405,8 +445,8 @@ def check_signal(symbol, an, levels):
                     send_telegram_message(f"⏭️ {symbol} LONG: no squeeze/banda"); continue
                 if USE_MTF and not mtf_filter(symbol,"LONG"):
                     send_telegram_message(f"⏭️ {symbol} LONG: 1h non allineato"); continue
-                open_trade(symbol,"LONG", float(last["close"]), atr, rr_checked=False)
-                last_signal[symbol]="LONG"
+                open_trade(symbol,"LONG", float(last["close"]), atr, kind="SAFE", rr_checked=False)
+                last_signal[symbol]="LONG"; last_signal_type[symbol]="SAFE"
             elif volume_usdt<=vol_thresh:
                 send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
 
@@ -420,13 +460,38 @@ def check_signal(symbol, an, levels):
                     send_telegram_message(f"⏭️ {symbol} SHORT: no squeeze/banda"); continue
                 if USE_MTF and not mtf_filter(symbol,"SHORT"):
                     send_telegram_message(f"⏭️ {symbol} SHORT: 1h non allineato"); continue
-                open_trade(symbol,"SHORT", float(last["close"]), atr, rr_checked=False)
-                last_signal[symbol]="SHORT"
+                open_trade(symbol,"SHORT", float(last["close"]), atr, kind="SAFE", rr_checked=False)
+                last_signal[symbol]="SHORT"; last_signal_type[symbol]="SAFE"
             elif volume_usdt<=vol_thresh:
                 send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
 
+    # ====== AGGRESSIVO (nuovo) ======
+    if USE_AGGR and active_trade[symbol] is None:
+        # LONG aggressivo
+        for level in levels["breakout"]:
+            buf_aggr = level*(1+AGGR_BUFFER_PCT)
+            if (last["close"]>buf_aggr and ema20>=ema60 and valid_break(level, price)):
+                if aggr_vol_ok(df) and confluence_score(df,"LONG") >= AGGR_MIN_CONFLUENCE:
+                    # MTF/squeeze/rr possono essere mancanti → segnaliamo lo stesso
+                    rr_needed = AGGR_REQUIRE_RR
+                    open_trade(symbol,"LONG", float(last["close"]), atr, kind="AGGR", rr_checked=rr_needed)
+                    last_signal[symbol]="LONG"; last_signal_type[symbol]="AGGR"
+                    break
+
+        # SHORT aggressivo
+        for level in levels["breakdown"]:
+            buf_aggr = level*(1-AGGR_BUFFER_PCT)
+            if (last["close"]<buf_aggr and ema20<=ema60 and valid_break(level, price)):
+                if aggr_vol_ok(df) and confluence_score(df,"SHORT") >= AGGR_MIN_CONFLUENCE:
+                    rr_needed = AGGR_REQUIRE_RR
+                    open_trade(symbol,"SHORT", float(last["close"]), atr, kind="AGGR", rr_checked=rr_needed)
+                    last_signal[symbol]="SHORT"; last_signal_type[symbol]="AGGR"
+                    break
+
+    # Reset segnale se neutro
     if levels["breakdown"][-1] < price < levels["breakout"][0]:
         last_signal[symbol]=None
+        last_signal_type[symbol]=None
 
 # ------------- REPORT -------------
 def format_report_line(symbol, price, ema20, ema60, volume):

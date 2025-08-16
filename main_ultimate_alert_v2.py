@@ -84,11 +84,16 @@ USE_CVD_FILTER    = True      # richiedi CVD/DELTA favorevole per segnali "sicur
 DELTA_SPIKE_MULT  = 1.5       # spike di DELTA per "aggressivo"
 USE_VWAP_FILTER   = True      # conferma sopra/sotto VWAP
 
+# Robustezza dati
+SEND_SOURCE_IN_REPORT = True        # mostra la fonte dati nel report
+HTTP_RETRIES = 3                    # tentativi/endpoint
+HTTP_TIMEOUT = 8
+
 # Report giornaliero
 DAILY_REPORT_IT_HM = ("23","59")  # Italia
 
-# API (fallback storico “classico”)
-MEXC_KLINE_URL = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
+# API
+MEXC_KLINE_URL    = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
 BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
 
 # Stato segnali
@@ -133,51 +138,22 @@ def send_startup_once():
     except Exception as e:
         print("startup flag err:", e)
 
-# ---------------- DATA ----------------
-def get_klines_mexc(symbol: str, interval="15m", limit=120):
-    url = MEXC_KLINE_URL.format(symbol=symbol, interval=interval, limit=limit)
-    try:
-        resp = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
-        return resp.json()
-    except Exception as e:
-        print("mexc klines err:", e)
-        return None
+# ---------------- DATA (ROBUST) ----------------
+def http_get(url):
+    last_err = None
+    for i in range(HTTP_RETRIES):
+        try:
+            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=HTTP_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(0.3 * (2**i))  # backoff 0.3s, 0.6s, 1.2s
+    print("[http_get] fail:", url, "|", last_err)
+    return None
 
-def get_klines_binance(symbol: str, interval="15m", limit=120):
-    url = BINANCE_KLINE_URL.format(symbol=symbol, interval=interval, limit=limit)
-    try:
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print("binance klines err:", e)
-        return None
-
-def build_df(symbol, interval="15m", limit=120):
-    """Storico classico (MEXC) – senza DELTA/CVD/VWAP. Usato come fallback."""
-    data = get_klines_mexc(symbol, interval, limit)
-    if not isinstance(data, list) or (len(data) and not isinstance(data[0], (list,tuple))):
-        print(f"[WARN] API {symbol} MEXC risponde strana.")
-        return None
-    if not data: return None
-
-    rows = []
-    for r in data:
-        if len(r) >= 12:
-            open_time, open_, high, low, close, volume, close_time, *_ = r[:7]
-        elif len(r) >= 8:
-            open_time, open_, high, low, close, volume, close_time = r[:7]
-        else:
-            continue
-        rows.append({
-            "open_time":  pd.to_datetime(int(open_time), unit="ms"),
-            "open":  float(open_), "high": float(high), "low": float(low),
-            "close": float(close), "volume": float(volume),
-            "close_time": pd.to_datetime(int(close_time), unit="ms"),
-        })
-    if not rows: return None
-    df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
-
+def _df_common_indicators(df):
     # ATR
     prev_close = df["close"].shift(1)
     tr = pd.concat([
@@ -211,90 +187,84 @@ def build_df(symbol, interval="15m", limit=120):
     df["BB_LOW"] = mid - 2*std
     df["BB_BW"]  = (df["BB_UP"]-df["BB_LOW"])/mid
 
-    # EMA per MTF checks
+    # MTF EMAs
     df["EMA50"]  = df["close"].ewm(span=50, adjust=False).mean()
     df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
-
     return df
 
-def build_df_with_cvd(symbol, interval="15m", limit=120):
-    """Storico da Binance con DELTA/CVD/VWAP."""
-    data = get_klines_binance(symbol, interval, limit)
-    if not isinstance(data, list): 
-        return None
+def build_df_binance(symbol, interval="15m", limit=120):
+    """Preferita: ha taker-buy per DELTA/CVD e VWAP."""
+    data = http_get(BINANCE_KLINE_URL.format(symbol=symbol, interval=interval, limit=limit))
+    if not isinstance(data, list) or not data:
+        return None, None
     rows = []
     for k in data:
-        # Binance: [0]openTime [1]open [2]high [3]low [4]close [5]volume
-        # [6]closeTime [7]quoteVol [8]trades [9]takerBuyBase [10]takerBuyQuote [11]ignore
         rows.append({
             "open_time":  pd.to_datetime(int(k[0]), unit="ms"),
             "open":  float(k[1]), "high": float(k[2]), "low": float(k[3]),
             "close": float(k[4]), "volume": float(k[5]),
             "close_time": pd.to_datetime(int(k[6]), unit="ms"),
-            "tbb":   float(k[9])   # taker buy base volume
+            "tbb": float(k[9]) if len(k) > 9 else None
         })
-    if not rows: return None
     df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
 
-    # Delta & CVD
-    df["tbs"]   = (df["volume"] - df["tbb"]).clip(lower=0)  # taker sell base approx
-    df["DELTA"] = df["tbb"] - df["tbs"]
-    df["CVD"]   = df["DELTA"].cumsum()
-    df["CVD_SLOPE"] = df["CVD"].diff()
+    # Order-flow
+    if df["tbb"].notna().any():
+        df["tbs"]   = (df["volume"] - df["tbb"]).clip(lower=0)
+        df["DELTA"] = df["tbb"] - df["tbs"]
+        df["CVD"]   = df["DELTA"].cumsum()
+        df["CVD_SLOPE"] = df["CVD"].diff()
 
-    # ATR
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        (df["high"]-df["low"]).abs(),
-        (df["high"]-prev_close).abs(),
-        (df["low"] -prev_close).abs()
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean().bfill()
+        # VWAP intraday
+        day = df["close_time"].dt.date
+        typical = (df["high"]+df["low"]+df["close"])/3
+        df["cum_pv"] = (typical*df["volume"]).groupby(day).cumsum()
+        df["cum_v"]  = df["volume"].groupby(day).cumsum()
+        df["VWAP"]   = df["cum_pv"] / df["cum_v"]
 
-    # MACD / KDJ / Bollinger
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
+    df = _df_common_indicators(df)
+    return df, "Binance"
 
-    low_min  = df["low"].rolling(window=9, min_periods=9).min()
-    high_max = df["high"].rolling(window=9, min_periods=9).max()
-    denom = (high_max - low_min).replace(0, np.nan)
-    rsv = (df["close"] - low_min) / denom * 100
-    df["K"] = rsv.ewm(com=2, adjust=False).mean()
-    df["D"] = df["K"].ewm(com=2, adjust=False).mean()
-    df["J"] = 3*df["K"] - 2*df["D"]
+def build_df_mexc(symbol, interval="15m", limit=120):
+    """Fallback: nessun DELTA/CVD/VWAP, ma mantiene gli indicatori classici."""
+    data = http_get(MEXC_KLINE_URL.format(symbol=symbol, interval=interval, limit=limit))
+    if not isinstance(data, list) or not data:
+        return None, None
+    rows = []
+    for r in data:
+        open_time, open_, high, low, close, volume, close_time = r[:7]
+        rows.append({
+            "open_time":  pd.to_datetime(int(open_time), unit="ms"),
+            "open":  float(open_), "high": float(high), "low": float(low),
+            "close": float(close), "volume": float(volume),
+            "close_time": pd.to_datetime(int(close_time), unit="ms"),
+        })
+    df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
+    df = _df_common_indicators(df)
+    return df, "MEXC"
 
-    mid = df["close"].rolling(BB_WINDOW).mean()
-    std = df["close"].rolling(BB_WINDOW).std()
-    df["BB_MID"] = mid
-    df["BB_UP"]  = mid + 2*std
-    df["BB_LOW"] = mid - 2*std
-    df["BB_BW"]  = (df["BB_UP"]-df["BB_LOW"])/mid
-
-    df["EMA50"]  = df["close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
-
-    # VWAP intraday (reset a mezzanotte UTC)
-    day = df["close_time"].dt.date
-    typical = (df["high"]+df["low"]+df["close"])/3
-    df["cum_pv"] = (typical*df["volume"]).groupby(day).cumsum()
-    df["cum_v"]  = df["volume"].groupby(day).cumsum()
-    df["VWAP"]   = df["cum_pv"] / df["cum_v"]
-
-    return df
+def build_df_unified(symbol, interval="15m", limit=120):
+    """
+    Prova prima Binance (con order-flow).
+    Se fallisce, passa a MEXC in automatico.
+    Ritorna (df, source) oppure (None, None).
+    """
+    df, src = build_df_binance(symbol, interval, limit)
+    if isinstance(df, pd.DataFrame) and len(df) > 50:
+        return df, src
+    df, src = build_df_mexc(symbol, interval, limit)
+    if isinstance(df, pd.DataFrame) and len(df) > 50:
+        return df, src
+    return None, None
 
 # ------------- NOTIFICA + GRAFICO -------------
 def build_chart_for(symbol, entry, tp, sl, kind="SAFE"):
-    # per il grafico usiamo i dati con CVD se disponibili
-    df = build_df_with_cvd(symbol, "15m", 120) if USE_BINANCE_CVD else build_df(symbol, "15m", 120)
+    df, _ = build_df_unified(symbol, "15m", 120)
     if df is None: raise RuntimeError("No data")
 
     fig, (ax1, ax2, ax3) = plt.subplots(3,1,figsize=(11,8),sharex=True,
                                         gridspec_kw={'height_ratios':[3,1,1]})
     ax1.plot(df["close_time"], df["close"], label=f"{symbol}/USDT")
-    # VWAP overlay se presente
     if "VWAP" in df.columns:
         ax1.plot(df["close_time"], df["VWAP"], linewidth=1.6, label="VWAP")
     ax1.grid(True, linewidth=0.4)
@@ -365,7 +335,7 @@ def mtf_filter(symbol, direction):
     if not USE_MTF: 
         return True
 
-    df1h = (build_df_with_cvd(symbol, "1h", 300) if USE_BINANCE_CVD else build_df(symbol, "1h", 300))
+    df1h, _ = build_df_unified(symbol, "1h", 300)
     if df1h is None or len(df1h) < 200:
         ok1h = True
     else:
@@ -375,7 +345,7 @@ def mtf_filter(symbol, direction):
     if not USE_MTF_4H:
         return ok1h
 
-    df4h = (build_df_with_cvd(symbol, "4h", 300) if USE_BINANCE_CVD else build_df(symbol, "4h", 300))
+    df4h, _ = build_df_unified(symbol, "4h", 300)
     if df4h is None or len(df4h) < 200:
         ok4h = True
     else:
@@ -449,9 +419,9 @@ def log_trade(row):
 
 # ------------- ANALISI/SEGNALI -------------
 def analyze(symbol):
-    df = build_df_with_cvd(symbol, "15m", 120) if USE_BINANCE_CVD else build_df(symbol, "15m", 120)
+    df, source = build_df_unified(symbol, "15m", 120)
     if df is None:
-        send_telegram_message(f"⚠️ Errore dati {symbol}")
+        send_telegram_message(f"⚠️ Errore dati {symbol} (tutte le fonti)")
         return None
     closes = df["close"].tolist()
     vols   = df["volume"].tolist()
@@ -460,7 +430,8 @@ def analyze(symbol):
     ema20 = calc_ema(closes[-20:], 20)
     ema60 = calc_ema(closes[-60:], 60)
     atr14 = df["ATR"].iloc[-1]
-    return {"price": last_close, "volume": last_vol, "ema20": ema20, "ema60": ema60, "atr": atr14, "df": df}
+    return {"price": last_close, "volume": last_vol, "ema20": ema20, "ema60": ema60,
+            "atr": atr14, "df": df, "source": source}
 
 def open_trade(symbol, direction, entry_price, atr, kind="SAFE", rr_checked=True, extra_text=""):
     if direction=="LONG":
@@ -539,6 +510,17 @@ def monitor_trade(symbol, price, df15):
             active_trade[symbol]=None; return
 
 # ------------- CHECK SEGNALE -------------
+def squeeze_ok(df15, direction):
+    if not USE_BB_SQUEEZE: return True
+    last = df15.iloc[-1]
+    recent = df15.tail(10)
+    sq = (recent["BB_BW"] < BB_SQ_THRESHOLD).any()
+    if not sq: return False
+    if direction=="LONG":
+        return last["close"] > last["BB_UP"]
+    else:
+        return last["close"] < last["BB_LOW"]
+
 def check_signal(symbol, an, levels):
     global last_signal, last_signal_type
     df = an["df"]; price = an["price"]; ema20=an["ema20"]; ema60=an["ema60"]; atr=an["atr"]
@@ -649,13 +631,15 @@ def check_signal(symbol, an, levels):
         last_signal_type[symbol]=None
 
 # ------------- REPORT -------------
-def format_report_line(symbol, df, price, ema20, ema60, volume):
+def format_report_line(symbol, df, price, ema20, ema60, volume, source=None):
     trend = "🟢" if ema20>ema60 else "🔴" if ema20<ema60 else "⚪"
     base = f"{trend} {symbol}: {round(price,2)}$ | EMA20:{round(ema20,2)} | EMA60:{round(ema60,2)} | Vol:{round(volume/1e6,1)}M"
     if "VWAP" in df.columns:
         base += " | " + ("↑ sopra VWAP" if price>=df['VWAP'].iloc[-1] else "↓ sotto VWAP")
     if "DELTA" in df.columns and "CVD_SLOPE" in df.columns:
         base += f" | Δ:{round(df['DELTA'].iloc[-1],2)} | CVDΔ:{round(df['CVD_SLOPE'].iloc[-1],2)}"
+    if SEND_SOURCE_IN_REPORT and source:
+        base += f" | src:{source}"
     return base
 
 def build_suggestion(btc_trend, eth_trend):
@@ -694,11 +678,11 @@ if __name__ == "__main__":
         for symbol in ["BTC","ETH"]:
             an = analyze(symbol)
             if an:
-                price, vol, ema20, ema60, df = an["price"], an["volume"], an["ema20"], an["ema60"], an["df"]
+                price, vol, ema20, ema60, df, src = an["price"], an["volume"], an["ema20"], an["ema60"], an["df"], an.get("source")
                 check_signal(symbol, an, LEVELS[symbol])
                 monitor_trade(symbol, price, df)
                 trends[symbol] = "🟢" if ema20>ema60 else "🔴" if ema20<ema60 else "⚪"
-                report_msg += f"\n{format_report_line(symbol, df, price, ema20, ema60, vol)}"
+                report_msg += f"\n{format_report_line(symbol, df, price, ema20, ema60, vol, src)}"
             else:
                 report_msg += f"\n{symbol}: Errore dati"; trends[symbol]="⚪"
 

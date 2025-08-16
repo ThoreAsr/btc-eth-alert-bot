@@ -1,6 +1,7 @@
 import os
 import csv
 import time
+import random
 import requests
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
@@ -18,7 +19,7 @@ def calc_ema(data, period):
     if not data:
         return 0.0
     if len(data) < period:
-        return sum(data) / len(data)
+        return sum(data) / max(len(data), 1)
     k = 2 / (period + 1)
     ema = data[0]
     for price in data[1:]:
@@ -64,7 +65,7 @@ BB_SQ_THRESHOLD    = 0.06    # (upper-lower)/mid < 6%
 USE_ATR_VOL_FILTER = True
 ATR_VOL_MIN_PCT    = 0.35/100   # ATR/close ≥ 0.35%
 
-USE_PARTIAL_1R     = True   # chiusura 50% a +1R
+USE_PARTIAL_1R     = True   # chiusura 50% a +1R (simulato)
 USE_TRAILING_CH    = True   # trailing chandelier dopo +1R
 CH_PERIOD          = 22
 CH_ATR_MULT        = 2.5
@@ -79,10 +80,15 @@ AGGR_MIN_CONFLUENCE  = 2        # min 2 condizioni favorevoli (EMA, MACD, K-D)
 AGGR_REQUIRE_RR      = False    # ignora R/R minimo (True per richiederlo)
 
 # ---- Order Flow (volumetrica) ----
-USE_BINANCE_CVD   = True      # usa candele Binance con taker-buy per DELTA/CVD/VWAP
 USE_CVD_FILTER    = True      # richiedi CVD/DELTA favorevole per segnali "sicuri"
 DELTA_SPIKE_MULT  = 1.5       # spike di DELTA per "aggressivo"
 USE_VWAP_FILTER   = True      # conferma sopra/sotto VWAP
+
+# ---- Momentum Thrust (fallback quando manca CVD) ----
+USE_THRUST            = True
+THRUST_LOOKBACK_BARS  = 3      # confronto con close di N barre fa
+THRUST_PCT            = 0.60/100   # incremento minimo di prezzo
+THRUST_VOL_MULT       = 1.8    # volume spike rispetto mediana 20
 
 # Robustezza dati
 SEND_SOURCE_IN_REPORT = True        # mostra la fonte dati nel report
@@ -95,11 +101,17 @@ DAILY_REPORT_IT_HM = ("23","59")  # Italia
 # API
 MEXC_KLINE_URL    = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
 BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
+BYBIT_KLINE_URL   = "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}USDT&interval={interval}&limit={limit}"
 
 # Stato segnali
 last_signal      = {"BTC": None, "ETH": None}
 last_signal_type = {"BTC": None, "ETH": None}  # "SAFE" o "AGGR"
 active_trade     = {"BTC": None, "ETH": None}
+
+# Ricorda fonte buona recente (evita rimbalzi)
+PREFERRED_SRC = {"BTC": None, "ETH": None}
+PREFERRED_TTL = 30 * 60  # 30 minuti
+PREFERRED_TS  = {"BTC": 0, "ETH": 0}
 
 # Startup flag 12h
 STARTUP_FLAG = "/tmp/bot_startup_flag.txt"
@@ -109,19 +121,23 @@ TRADES_CSV = "/tmp/trades.csv"
 tzIT = ZoneInfo("Europe/Rome")
 tzUTC = ZoneInfo("UTC")
 
+# ---- Sessione HTTP (riuso connessioni) ----
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent":"Mozilla/5.0 (OrderFlowBot/1.0)"})
+
 # ---------------- TELEGRAM ----------------
 def send_telegram_message(message: str):
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": message}, timeout=6)
+        HTTP.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  data={"chat_id": CHAT_ID, "text": message}, timeout=6)
     except Exception as e:
         print("TG error:", e)
 
 def send_photo(buf: bytes, caption: str):
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-                      data={"chat_id": CHAT_ID, "caption": caption},
-                      files={"photo": ("chart.png", buf)}, timeout=18)
+        HTTP.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+                  data={"chat_id": CHAT_ID, "caption": caption},
+                  files={"photo": ("chart.png", buf)}, timeout=18)
     except Exception as e:
         print("TG photo error:", e)
 
@@ -132,7 +148,7 @@ def send_startup_once():
                 ts = float((f.read() or "0").strip())
             if time.time() - ts < STARTUP_COOLDOWN_SEC:
                 return
-        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 + Aggressive Mode + Volatility + CVD/VWAP")
+        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 + Aggressive+Momentum + Volatility + CVD/VWAP | Multi-source")
         with open(STARTUP_FLAG,"w") as f:
             f.write(str(time.time()))
     except Exception as e:
@@ -143,13 +159,14 @@ def http_get(url):
     last_err = None
     for i in range(HTTP_RETRIES):
         try:
-            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=HTTP_TIMEOUT)
+            r = HTTP.get(url, timeout=HTTP_TIMEOUT)
             if r.status_code == 200:
                 return r.json()
             last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = str(e)
-        time.sleep(0.3 * (2**i))  # backoff 0.3s, 0.6s, 1.2s
+        # backoff con jitter
+        time.sleep((0.25 + random.random()*0.15) * (2**i))
     print("[http_get] fail:", url, "|", last_err)
     return None
 
@@ -204,7 +221,7 @@ def build_df_binance(symbol, interval="15m", limit=120):
             "open":  float(k[1]), "high": float(k[2]), "low": float(k[3]),
             "close": float(k[4]), "volume": float(k[5]),
             "close_time": pd.to_datetime(int(k[6]), unit="ms"),
-            "tbb": float(k[9]) if len(k) > 9 else None
+            "tbb": float(k[9]) if len(k) > 9 and k[9] is not None else np.nan
         })
     df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
 
@@ -225,6 +242,32 @@ def build_df_binance(symbol, interval="15m", limit=120):
     df = _df_common_indicators(df)
     return df, "Binance"
 
+def build_df_bybit(symbol, interval="15", limit=200):
+    """
+    Bybit v5. interval in minuti come stringa "15","60","240".
+    Ritorna dataframe senza CVD/VWAP (manca taker-buy).
+    """
+    data = http_get(BYBIT_KLINE_URL.format(symbol=symbol, interval=interval, limit=min(limit,200)))
+    try:
+        arr = data.get("result", {}).get("list", [])
+    except Exception:
+        arr = None
+    if not isinstance(arr, list) or not arr:
+        return None, None
+
+    rows = []
+    for k in reversed(arr):  # Bybit restituisce decrescente
+        # k: [start, open, high, low, close, volume, turnover]
+        rows.append({
+            "open_time":  pd.to_datetime(int(k[0]), unit="ms"),
+            "open":  float(k[1]), "high": float(k[2]), "low": float(k[3]),
+            "close": float(k[4]), "volume": float(k[5]),
+            "close_time": pd.to_datetime(int(k[0]), unit="ms") + timedelta(minutes=int(interval))
+        })
+    df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
+    df = _df_common_indicators(df)
+    return df, "Bybit"
+
 def build_df_mexc(symbol, interval="15m", limit=120):
     """Fallback: nessun DELTA/CVD/VWAP, ma mantiene gli indicatori classici."""
     data = http_get(MEXC_KLINE_URL.format(symbol=symbol, interval=interval, limit=limit))
@@ -243,17 +286,42 @@ def build_df_mexc(symbol, interval="15m", limit=120):
     df = _df_common_indicators(df)
     return df, "MEXC"
 
+def _still_fresh(ts):  # preferenza sorgente recente
+    return (time.time() - ts) < PREFERRED_TTL
+
 def build_df_unified(symbol, interval="15m", limit=120):
     """
-    Prova prima Binance (con order-flow).
-    Se fallisce, passa a MEXC in automatico.
+    Prova prima la fonte preferita recente, poi:
+    Binance (con order-flow) → Bybit → MEXC.
     Ritorna (df, source) oppure (None, None).
     """
+    # 1) fonte preferita recente
+    pref = PREFERRED_SRC.get(symbol)
+    if pref and _still_fresh(PREFERRED_TS.get(symbol, 0)):
+        if pref == "Binance":
+            df, src = build_df_binance(symbol, interval, limit)
+        elif pref == "Bybit":
+            df, src = build_df_bybit(symbol, interval.replace("m",""), limit)
+        else:
+            df, src = build_df_mexc(symbol, interval, limit)
+        if isinstance(df, pd.DataFrame) and len(df) > 50:
+            return df, src
+
+    # 2) tentativi in cascata
+    # Binance
     df, src = build_df_binance(symbol, interval, limit)
     if isinstance(df, pd.DataFrame) and len(df) > 50:
+        PREFERRED_SRC[symbol], PREFERRED_TS[symbol] = "Binance", time.time()
         return df, src
+    # Bybit
+    df, src = build_df_bybit(symbol, interval.replace("m",""), limit)
+    if isinstance(df, pd.DataFrame) and len(df) > 50:
+        PREFERRED_SRC[symbol], PREFERRED_TS[symbol] = "Bybit", time.time()
+        return df, src
+    # MEXC
     df, src = build_df_mexc(symbol, interval, limit)
     if isinstance(df, pd.DataFrame) and len(df) > 50:
+        PREFERRED_SRC[symbol], PREFERRED_TS[symbol] = "MEXC", time.time()
         return df, src
     return None, None
 
@@ -397,6 +465,19 @@ def vwap_filter_ok(df15, direction):
     return (direction=="LONG" and last["close"] >= last["VWAP"]) or \
            (direction=="SHORT" and last["close"] <= last["VWAP"])
 
+# ---- Momentum Thrust (fallback quando non c’è DELTA) ----
+def thrust_ok(df15, direction):
+    if not USE_THRUST or len(df15) < (THRUST_LOOKBACK_BARS+1):
+        return False
+    last = df15.iloc[-1]
+    ref  = df15.iloc[-(THRUST_LOOKBACK_BARS+1)]
+    move_pct = (last["close"] - ref["close"]) / max(ref["close"],1e-9) * 100
+    vol_spike = last["volume"] >= THRUST_VOL_MULT * df15["volume"].tail(20).median()
+    if direction == "LONG":
+        return (move_pct >= THRUST_PCT*100) and vol_spike
+    else:
+        return (move_pct <= -THRUST_PCT*100) and vol_spike
+
 def rr_ok(entry, tp, sl):
     risk = abs(entry - sl); reward = abs(tp - entry)
     rr = reward/max(risk,1e-9)
@@ -531,7 +612,7 @@ def check_signal(symbol, an, levels):
 
     last = df.iloc[-1]; prev=df.iloc[-2]
 
-    def valid_break(level, current_price):  # legacy
+    def valid_break(level, current_price):
         return abs((current_price-level)/level) > MIN_MOVE_PCT
 
     def breakout_ok(level):
@@ -603,11 +684,14 @@ def check_signal(symbol, an, levels):
         for level in levels["breakout"]:
             buf_aggr = level*(1+AGGR_BUFFER_PCT)
             if (last["close"]>buf_aggr and ema20>=ema60 and valid_break(level, price)):
-                if aggr_vol_ok(df) and confluence_score(df,"LONG") >= AGGR_MIN_CONFLUENCE and (not USE_CVD_FILTER or delta_spike(df)):
+                cond_of = (("DELTA" in df.columns) and delta_spike(df)) or thrust_ok(df,"LONG")
+                if aggr_vol_ok(df) and confluence_score(df,"LONG") >= AGGR_MIN_CONFLUENCE and cond_of:
                     rr_needed = AGGR_REQUIRE_RR
                     extra = ""
-                    if "DELTA" in df.columns:
+                    if "DELTA" in df.columns and delta_spike(df):
                         extra = f"Δ spike: {round(df['DELTA'].iloc[-1],2)}"
+                    elif thrust_ok(df,"LONG"):
+                        extra = "Momentum Thrust ✅"
                     open_trade(symbol,"LONG", float(last["close"]), atr, kind="AGGR", rr_checked=rr_needed, extra_text=extra)
                     last_signal[symbol]="LONG"; last_signal_type[symbol]="AGGR"
                     break
@@ -616,11 +700,14 @@ def check_signal(symbol, an, levels):
         for level in levels["breakdown"]:
             buf_aggr = level*(1-AGGR_BUFFER_PCT)
             if (last["close"]<buf_aggr and ema20<=ema60 and valid_break(level, price)):
-                if aggr_vol_ok(df) and confluence_score(df,"SHORT") >= AGGR_MIN_CONFLUENCE and (not USE_CVD_FILTER or delta_spike(df)):
+                cond_of = (("DELTA" in df.columns) and delta_spike(df)) or thrust_ok(df,"SHORT")
+                if aggr_vol_ok(df) and confluence_score(df,"SHORT") >= AGGR_MIN_CONFLUENCE and cond_of:
                     rr_needed = AGGR_REQUIRE_RR
                     extra = ""
-                    if "DELTA" in df.columns:
+                    if "DELTA" in df.columns and delta_spike(df):
                         extra = f"Δ spike: {round(df['DELTA'].iloc[-1],2)}"
+                    elif thrust_ok(df,"SHORT"):
+                        extra = "Momentum Thrust ✅"
                     open_trade(symbol,"SHORT", float(last["close"]), atr, kind="AGGR", rr_checked=rr_needed, extra_text=extra)
                     last_signal[symbol]="SHORT"; last_signal_type[symbol]="AGGR"
                     break

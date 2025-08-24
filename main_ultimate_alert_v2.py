@@ -144,6 +144,7 @@ def rr_compute(entry: float, stop: float, tp: float, risk_usd: float):
     return size, profit, rr
 
 _last_signal = {}  # (symbol, side) -> (ts, entry)
+
 def should_send_signal(symbol: str, side: str, entry: float, cooldown_min=COOLDOWN_MIN, tol=0.002):
     key = (symbol, side)
     last = _last_signal.get(key)
@@ -155,8 +156,9 @@ def should_send_signal(symbol: str, side: str, entry: float, cooldown_min=COOLDO
     _last_signal[key] = (now, entry)
     return True
 
-_last_heartbeat = now_utc() - timedelta(minutes=HEARTBEAT_MIN+1)
-_last_any_signal = now_utc() - timedelta(hours=NO_SIGNAL_ALERT_HOURS+1)
+# Stato heartbeat e segnali
+_last_heartbeat   = now_utc() - timedelta(minutes=HEARTBEAT_MIN+1)
+_last_any_signal  = now_utc() - timedelta(hours=NO_SIGNAL_ALERT_HOURS+1)
 
 def build_levels_report(levels_map, news_flags, cmc_map):
     lines = ["=============================", "🫀 HEARTBEAT – Livelli chiave", f"⏰ {now_utc()} UTC"]
@@ -234,14 +236,13 @@ while True:
                     news_flags[(sym, tf)] = news_mode
 
                     side = None
-                    reason = None
                     if acc and acc["long"]:
-                        side = "BUY"; reason = f"Acceptance sopra VAH + vol>{vm}× media {vw} barre"
+                        side = "BUY"
                     elif acc and acc["short"]:
-                        side = "SELL"; reason = f"Acceptance sotto VAL + vol>{vm}× media {vw} barre"
+                        side = "SELL"
 
                     results.append({
-                        "symbol": sym, "tf": tf, "side": side, "reason": reason,
+                        "symbol": sym, "tf": tf, "side": side,
                         "poc": poc, "vah": vah, "val": val, "close": last_close,
                         "vol_bar": acc["last_vol"] if acc else 0.0,
                         "vol_avg": acc["avg_vol"] if acc else 0.0,
@@ -294,17 +295,16 @@ while True:
             _last_any_signal = now_utc()
 
         # Heartbeat
-        global _last_heartbeat
         if (now_utc() - _last_heartbeat) >= timedelta(minutes=HEARTBEAT_MIN):
             hb = build_levels_report(levels_map, news_flags, cmc_map)
             print(hb); send_telegram(hb)
             _last_heartbeat = now_utc()
 
-        # Failsafe: nessun segnale da troppo tempo
+        # Failsafe
         if (now_utc() - _last_any_signal) >= timedelta(hours=NO_SIGNAL_ALERT_HOURS):
-            warn = f"⚠️ Nessun segnale valido da {NO_SIGNAL_ALERT_HOURS}h – mercato probabilmente in bilanciamento. Continua a seguire heartbeat e livelli."
+            warn = f"⚠️ Nessun segnale valido da {NO_SIGNAL_ALERT_HOURS}h – mercato probabilmente in bilanciamento."
             print(warn); send_telegram(warn)
-            _last_any_signal = now_utc()  # evita spam
+            _last_any_signal = now_utc()
 
         time.sleep(30)
 

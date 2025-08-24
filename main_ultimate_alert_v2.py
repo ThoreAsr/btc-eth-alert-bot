@@ -1,780 +1,313 @@
-import os
-import csv
-import time
-import random
 import requests
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
-
-# === LIBRERIE PER GRAFICI ===
-import io
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import pandas as pd
 import numpy as np
+import time
+from datetime import datetime, timedelta
 
-# ---------- FUNZIONI BASE ----------
-def calc_ema(data, period):
-    """Calcola una EMA semplice su una lista di prezzi."""
-    if not data:
-        return 0.0
-    if len(data) < period:
-        return sum(data) / max(len(data), 1)
-    k = 2 / (period + 1)
-    ema = data[0]
-    for price in data[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-# -----------------------------------
+# ==========================
+# CONFIG
+# ==========================
+CAPITALE = 2000
+RISK_PERCENT = 0.01                  # 1% per trade
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+TIMEFRAMES = ["15m", "30m"]
 
-# ================== CONFIG ==================
-TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
-CHAT_ID = "-1002181919588"
-
-# Livelli tuo setup
-LEVELS = {
-    "BTC": {"breakout": [117700, 118300], "breakdown": [116800, 116300]},
-    "ETH": {"breakout": [3190, 3250],    "breakdown": [3120, 3070]}
+# Filtri volume dinamici per TF
+TF_SETTINGS = {
+    "15m": {"vol_window": 10, "vol_mult": 1.10},
+    "30m": {"vol_window": 20, "vol_mult": 1.20},
 }
 
-# Soglie base
-VOLUME_THRESHOLDS = {"BTC": 5_000_000, "ETH": 2_000_000}  # USDT
-MIN_MOVE_PCT = 0.2/100
+BINS_PROFILE = 60                    # risoluzione profilo volume (POC/VAH/VAL)
+RR_MIN = 1.5                         # non inviare segnali con R:R < 1.5
+COOLDOWN_MIN = 15                    # no duplicati entro 15 minuti
+HEARTBEAT_MIN = 30                   # report livelli ogni 30 minuti
+NEWS_SPIKE_MULT = 2.5                # range barra > 2.5x media => NEWS MODE
+NO_SIGNAL_ALERT_HOURS = 36           # failsafe: alert se zero segnali per 36h
 
-# ATR & gestione trade
-ATR_PERIOD   = 14
-ATR_SL_MULT  = 1.2
-ATR_TP_MULT  = 2.0
-MIN_RR       = 1.5
+# CoinMarketCap (volumi globali)
+CMC_API_KEY = "e1bf46bf-1e42-4c30-8847-c011f772dcc8"
+CMC_REFRESH_SEC = 600                # cache CMC 10 minuti
 
-# Buffer/Retest (SICURO)
-BUFFER_PCT     = 0.05/100
-RETEST_TOL_PCT = 0.02/100
+# Telegram
+BOT_TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
+CHAT_ID = "356760541"
 
-# === Precision Pack toggles ===
-USE_MTF            = True    # filtro 1h
-USE_MTF_4H         = True    # 4h non deve essere contro trend (opzionale)
-USE_VOL_FILTER     = True    # vol 15m > 1.2× mediana 20
-VOL_MULT           = 1.2
-QUIET_HOURS_UTC    = [(0,3)] # no trade tra 00:00–03:59 UTC
-USE_BB_SQUEEZE     = True    # breakout dopo squeeze + close oltre banda
-BB_WINDOW          = 20
-BB_SQ_THRESHOLD    = 0.06    # (upper-lower)/mid < 6%
-
-# Filtro volatilità avanzato (salta segnali con ATR troppo basso)
-USE_ATR_VOL_FILTER = True
-ATR_VOL_MIN_PCT    = 0.35/100   # ATR/close ≥ 0.35%
-
-USE_PARTIAL_1R     = True   # chiusura 50% a +1R (simulato)
-USE_TRAILING_CH    = True   # trailing chandelier dopo +1R
-CH_PERIOD          = 22
-CH_ATR_MULT        = 2.5
-USE_TIMESTOP       = True   # esci a BE se dopo X barre MACD contro
-TIMESTOP_BARS      = 8
-
-# === Modalità "AGGRESSIVO" ===
-USE_AGGR             = True
-AGGR_VOL_MULT        = 1.5      # volume ≥ 1.5× mediana 20
-AGGR_BUFFER_PCT      = 0.20/100 # chiusura oltre livello di 0.20%
-AGGR_MIN_CONFLUENCE  = 2        # min 2 condizioni favorevoli (EMA, MACD, K-D)
-AGGR_REQUIRE_RR      = False    # ignora R/R minimo (True per richiederlo)
-
-# ---- Order Flow (volumetrica) ----
-USE_CVD_FILTER    = True      # richiedi CVD/DELTA favorevole per segnali "sicuri"
-DELTA_SPIKE_MULT  = 1.5       # spike di DELTA per "aggressivo"
-USE_VWAP_FILTER   = True      # conferma sopra/sotto VWAP
-
-# ---- Momentum Thrust (fallback quando manca CVD) ----
-USE_THRUST            = True
-THRUST_LOOKBACK_BARS  = 3      # confronto con close di N barre fa
-THRUST_PCT            = 0.60/100   # incremento minimo di prezzo
-THRUST_VOL_MULT       = 1.8    # volume spike rispetto mediana 20
-
-# Robustezza dati
-SEND_SOURCE_IN_REPORT = True        # mostra la fonte dati nel report
-HTTP_RETRIES = 3                    # tentativi/endpoint
-HTTP_TIMEOUT = 8
-
-# Report giornaliero
-DAILY_REPORT_IT_HM = ("23","59")  # Italia
-
-# API
-MEXC_KLINE_URL    = "https://api.mexc.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
-BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit={limit}"
-BYBIT_KLINE_URL   = "https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}USDT&interval={interval}&limit={limit}"
-
-# Stato segnali
-last_signal      = {"BTC": None, "ETH": None}
-last_signal_type = {"BTC": None, "ETH": None}  # "SAFE" o "AGGR"
-active_trade     = {"BTC": None, "ETH": None}
-
-# Ricorda fonte buona recente (evita rimbalzi)
-PREFERRED_SRC = {"BTC": None, "ETH": None}
-PREFERRED_TTL = 30 * 60  # 30 minuti
-PREFERRED_TS  = {"BTC": 0, "ETH": 0}
-
-# Startup flag 12h
-STARTUP_FLAG = "/tmp/bot_startup_flag.txt"
-STARTUP_COOLDOWN_SEC = 12 * 3600
-
-TRADES_CSV = "/tmp/trades.csv"
-tzIT = ZoneInfo("Europe/Rome")
-tzUTC = ZoneInfo("UTC")
-
-# ---- Sessione HTTP (riuso connessioni) ----
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent":"Mozilla/5.0 (OrderFlowBot/1.0)"})
-
-# ---------------- TELEGRAM ----------------
-def send_telegram_message(message: str):
+# ==========================
+# UTILS
+# ==========================
+def fmt(x, nd=2):
     try:
-        HTTP.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": message}, timeout=6)
-    except Exception as e:
-        print("TG error:", e)
-
-def send_photo(buf: bytes, caption: str):
-    try:
-        HTTP.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-                  data={"chat_id": CHAT_ID, "caption": caption},
-                  files={"photo": ("chart.png", buf)}, timeout=18)
-    except Exception as e:
-        print("TG photo error:", e)
-
-def send_startup_once():
-    try:
-        if os.path.exists(STARTUP_FLAG):
-            with open(STARTUP_FLAG,"r") as f:
-                ts = float((f.read() or "0").strip())
-            if time.time() - ts < STARTUP_COOLDOWN_SEC:
-                return
-        send_telegram_message("✅ Bot PRO attivo – Precision Pack v1 + Aggressive+Momentum + Volatility + CVD/VWAP | Multi-source")
-        with open(STARTUP_FLAG,"w") as f:
-            f.write(str(time.time()))
-    except Exception as e:
-        print("startup flag err:", e)
-
-# ---------------- DATA (ROBUST) ----------------
-def http_get(url):
-    last_err = None
-    for i in range(HTTP_RETRIES):
-        try:
-            r = HTTP.get(url, timeout=HTTP_TIMEOUT)
-            if r.status_code == 200:
-                return r.json()
-            last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = str(e)
-        # backoff con jitter
-        time.sleep((0.25 + random.random()*0.15) * (2**i))
-    print("[http_get] fail:", url, "|", last_err)
-    return None
-
-def _df_common_indicators(df):
-    # ATR
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        (df["high"]-df["low"]).abs(),
-        (df["high"]-prev_close).abs(),
-        (df["low"] -prev_close).abs()
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean().bfill()
-
-    # MACD
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
-
-    # KDJ
-    low_min  = df["low"].rolling(window=9, min_periods=9).min()
-    high_max = df["high"].rolling(window=9, min_periods=9).max()
-    denom = (high_max - low_min).replace(0, np.nan)
-    rsv = (df["close"] - low_min) / denom * 100
-    df["K"] = rsv.ewm(com=2, adjust=False).mean()
-    df["D"] = df["K"].ewm(com=2, adjust=False).mean()
-    df["J"] = 3*df["K"] - 2*df["D"]
-
-    # Bollinger
-    mid = df["close"].rolling(BB_WINDOW).mean()
-    std = df["close"].rolling(BB_WINDOW).std()
-    df["BB_MID"] = mid
-    df["BB_UP"]  = mid + 2*std
-    df["BB_LOW"] = mid - 2*std
-    df["BB_BW"]  = (df["BB_UP"]-df["BB_LOW"])/mid
-
-    # MTF EMAs
-    df["EMA50"]  = df["close"].ewm(span=50, adjust=False).mean()
-    df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
-    return df
-
-def build_df_binance(symbol, interval="15m", limit=120):
-    """Preferita: ha taker-buy per DELTA/CVD e VWAP."""
-    data = http_get(BINANCE_KLINE_URL.format(symbol=symbol, interval=interval, limit=limit))
-    if not isinstance(data, list) or not data:
-        return None, None
-    rows = []
-    for k in data:
-        rows.append({
-            "open_time":  pd.to_datetime(int(k[0]), unit="ms"),
-            "open":  float(k[1]), "high": float(k[2]), "low": float(k[3]),
-            "close": float(k[4]), "volume": float(k[5]),
-            "close_time": pd.to_datetime(int(k[6]), unit="ms"),
-            "tbb": float(k[9]) if len(k) > 9 and k[9] is not None else np.nan
-        })
-    df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
-
-    # Order-flow
-    if df["tbb"].notna().any():
-        df["tbs"]   = (df["volume"] - df["tbb"]).clip(lower=0)
-        df["DELTA"] = df["tbb"] - df["tbs"]
-        df["CVD"]   = df["DELTA"].cumsum()
-        df["CVD_SLOPE"] = df["CVD"].diff()
-
-        # VWAP intraday
-        day = df["close_time"].dt.date
-        typical = (df["high"]+df["low"]+df["close"])/3
-        df["cum_pv"] = (typical*df["volume"]).groupby(day).cumsum()
-        df["cum_v"]  = df["volume"].groupby(day).cumsum()
-        df["VWAP"]   = df["cum_pv"] / df["cum_v"]
-
-    df = _df_common_indicators(df)
-    return df, "Binance"
-
-def build_df_bybit(symbol, interval="15", limit=200):
-    """
-    Bybit v5. interval in minuti come stringa "15","60","240".
-    Ritorna dataframe senza CVD/VWAP (manca taker-buy).
-    """
-    data = http_get(BYBIT_KLINE_URL.format(symbol=symbol, interval=interval, limit=min(limit,200)))
-    try:
-        arr = data.get("result", {}).get("list", [])
+        return f"{x:,.{nd}f}"
     except Exception:
-        arr = None
-    if not isinstance(arr, list) or not arr:
-        return None, None
+        return str(x)
 
-    rows = []
-    for k in reversed(arr):  # Bybit restituisce decrescente
-        # k: [start, open, high, low, close, volume, turnover]
-        rows.append({
-            "open_time":  pd.to_datetime(int(k[0]), unit="ms"),
-            "open":  float(k[1]), "high": float(k[2]), "low": float(k[3]),
-            "close": float(k[4]), "volume": float(k[5]),
-            "close_time": pd.to_datetime(int(k[0]), unit="ms") + timedelta(minutes=int(interval))
-        })
-    df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
-    df = _df_common_indicators(df)
-    return df, "Bybit"
+def now_utc():
+    return datetime.utcnow()
 
-def build_df_mexc(symbol, interval="15m", limit=120):
-    """Fallback: nessun DELTA/CVD/VWAP, ma mantiene gli indicatori classici."""
-    data = http_get(MEXC_KLINE_URL.format(symbol=symbol, interval=interval, limit=limit))
-    if not isinstance(data, list) or not data:
-        return None, None
-    rows = []
-    for r in data:
-        open_time, open_, high, low, close, volume, close_time = r[:7]
-        rows.append({
-            "open_time":  pd.to_datetime(int(open_time), unit="ms"),
-            "open":  float(open_), "high": float(high), "low": float(low),
-            "close": float(close), "volume": float(volume),
-            "close_time": pd.to_datetime(int(close_time), unit="ms"),
-        })
-    df = pd.DataFrame(rows).sort_values("close_time").reset_index(drop=True)
-    df = _df_common_indicators(df)
-    return df, "MEXC"
-
-def _still_fresh(ts):  # preferenza sorgente recente
-    return (time.time() - ts) < PREFERRED_TTL
-
-def build_df_unified(symbol, interval="15m", limit=120):
-    """
-    Prova prima la fonte preferita recente, poi:
-    Binance (con order-flow) → Bybit → MEXC.
-    Ritorna (df, source) oppure (None, None).
-    """
-    # 1) fonte preferita recente
-    pref = PREFERRED_SRC.get(symbol)
-    if pref and _still_fresh(PREFERRED_TS.get(symbol, 0)):
-        if pref == "Binance":
-            df, src = build_df_binance(symbol, interval, limit)
-        elif pref == "Bybit":
-            df, src = build_df_bybit(symbol, interval.replace("m",""), limit)
-        else:
-            df, src = build_df_mexc(symbol, interval, limit)
-        if isinstance(df, pd.DataFrame) and len(df) > 50:
-            return df, src
-
-    # 2) tentativi in cascata
-    # Binance
-    df, src = build_df_binance(symbol, interval, limit)
-    if isinstance(df, pd.DataFrame) and len(df) > 50:
-        PREFERRED_SRC[symbol], PREFERRED_TS[symbol] = "Binance", time.time()
-        return df, src
-    # Bybit
-    df, src = build_df_bybit(symbol, interval.replace("m",""), limit)
-    if isinstance(df, pd.DataFrame) and len(df) > 50:
-        PREFERRED_SRC[symbol], PREFERRED_TS[symbol] = "Bybit", time.time()
-        return df, src
-    # MEXC
-    df, src = build_df_mexc(symbol, interval, limit)
-    if isinstance(df, pd.DataFrame) and len(df) > 50:
-        PREFERRED_SRC[symbol], PREFERRED_TS[symbol] = "MEXC", time.time()
-        return df, src
-    return None, None
-
-# ------------- NOTIFICA + GRAFICO -------------
-def build_chart_for(symbol, entry, tp, sl, kind="SAFE"):
-    df, _ = build_df_unified(symbol, "15m", 120)
-    if df is None: raise RuntimeError("No data")
-
-    fig, (ax1, ax2, ax3) = plt.subplots(3,1,figsize=(11,8),sharex=True,
-                                        gridspec_kw={'height_ratios':[3,1,1]})
-    ax1.plot(df["close_time"], df["close"], label=f"{symbol}/USDT")
-    if "VWAP" in df.columns:
-        ax1.plot(df["close_time"], df["VWAP"], linewidth=1.6, label="VWAP")
-    ax1.grid(True, linewidth=0.4)
-
-    # palette per tipo segnale
-    if kind == "SAFE":
-        c_entry, c_tp, c_sl = "#16a34a", "#f59e0b", "#ef4444"      # verde / arancio / rosso
-    else:
-        c_entry, c_tp, c_sl = "#06b6d4", "#8b5cf6", "#64748b"      # ciano / viola / grigio
-
-    ax1.axhline(entry, color=c_entry, linestyle="--",      linewidth=2.2, label="Entrata")
-    ax1.axhline(tp,    color=c_tp,    linestyle=(0,(9,4)), linewidth=2.2, label="Target")
-    ax1.axhline(sl,    color=c_sl,    linestyle=(0,(3,3)), linewidth=2.2, label="Stop")
-
-    def annotate(y, text, c):
-        ax1.text(df["close_time"].iloc[-1], y, f"  {text}", color=c,
-                 va="center", fontsize=10, bbox=dict(facecolor="white", alpha=0.7, edgecolor=c))
-    annotate(entry, f"Entrata {round(entry,2)}", c_entry)
-    annotate(tp,    f"Target {round(tp,2)}",     c_tp)
-    annotate(sl,    f"Stop {round(sl,2)}",       c_sl)
-
-    ax1.set_ylabel("USDT"); ax1.legend(loc="upper left")
-
-    colors = np.where(df["MACD_HIST"]>=0, "#16a34a", "#ef4444")
-    ax2.bar(df["close_time"], df["MACD_HIST"], color=colors, label="Hist")
-    ax2.plot(df["close_time"], df["MACD"], label="MACD")
-    ax2.plot(df["close_time"], df["MACD_SIGNAL"], label="Signal")
-    ax2.grid(True, linewidth=0.4); ax2.legend(loc="upper left")
-
-    ax3.plot(df["close_time"], df["K"], label="K")
-    ax3.plot(df["close_time"], df["D"], label="D")
-    ax3.plot(df["close_time"], df["J"], label="J")
-    ax3.grid(True, linewidth=0.4); ax3.legend(loc="upper left")
-
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-    plt.xticks(rotation=45); plt.tight_layout()
-    buf = io.BytesIO(); plt.savefig(buf, format="png", dpi=220, bbox_inches="tight")
-    plt.close(fig); buf.seek(0)
-    return buf.getvalue()
-
-def notify_signal(symbol, direction, entry, tp, sl, kind="SAFE", rr=None, extra_text=""):
-    if kind == "SAFE":
-        title = f"✅ ENTRATA SICURA {direction} {symbol} 15m | Ingresso {round(entry,2)}"
-        note  = "✔️ Tutte le conferme attive"
-    else:
-        title = f"🚀 BREAKOUT AGGRESSIVO {direction} {symbol} 15m | Ingresso {round(entry,2)}"
-        note  = "⚠️ Segnale ad alto rischio (conferme parziali)"
-    send_telegram_message(title)
-    rr_txt = f" | R/R ≈ {rr:.2f}" if rr is not None else ""
-    if extra_text:
-        extra_text = "\n" + extra_text
-    send_telegram_message(f"🎯 Target: {round(tp,2)}   🛑 Stop: {round(sl,2)}{rr_txt}\n⏱️ TF: 15m   {note}{extra_text}")
+def send_telegram(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        send_photo(build_chart_for(symbol, entry, tp, sl, kind), f"📸 Grafico 15m ({'Sicuro' if kind=='SAFE' else 'Aggressivo'})")
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
     except Exception as e:
-        print("chart err:", e)
+        print("Errore invio Telegram:", e)
 
-# ------------- UTILITY -------------
-def in_quiet_hours_now():
-    now_utc = datetime.now(tzUTC).hour
-    for start,end in QUIET_HOURS_UTC:
-        if start <= now_utc <= end:
-            return True
-    return False
+# ==========================
+# DATA
+# ==========================
+def get_ohlcv(symbol="BTCUSDT", interval="15m", limit=300):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data, columns=[
+        "time","open","high","low","close","volume","c1","c2","c3","c4","c5","c6"
+    ])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    return df[["time","open","high","low","close","volume"]]
 
-def mtf_filter(symbol, direction):
-    """Richiede 1h allineato e (se attivo) 4h non opposto netto."""
-    if not USE_MTF: 
-        return True
+_cmc_cache = {}  # { "BTC": (volume, ts) }
+def get_global_volume(symbol_root="BTC"):
+    now = time.time()
+    vol, ts = _cmc_cache.get(symbol_root, (None, 0))
+    if vol is not None and (now - ts) < CMC_REFRESH_SEC:
+        return vol
+    try:
+        url = f"https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol={symbol_root}"
+        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        vol = j["data"][symbol_root]["quote"]["USD"]["volume_24h"]
+        _cmc_cache[symbol_root] = (vol, now)
+        return vol
+    except Exception as e:
+        print("Errore CMC:", e)
+        return vol if vol is not None else 0.0
 
-    df1h, _ = build_df_unified(symbol, "1h", 300)
-    if df1h is None or len(df1h) < 200:
-        ok1h = True
-    else:
-        ema50_1h, ema200_1h = df1h["EMA50"].iloc[-1], df1h["EMA200"].iloc[-1]
-        ok1h = (direction=="LONG" and ema50_1h>ema200_1h) or (direction=="SHORT" and ema50_1h<ema200_1h)
+# ==========================
+# VOLUME PROFILE
+# ==========================
+def build_volume_profile(df: pd.DataFrame, bins=BINS_PROFILE):
+    prices = (df["high"] + df["low"]) / 2.0
+    volumes = df["volume"]
+    hist, edges = np.histogram(prices, bins=bins, weights=volumes)
+    if hist.sum() == 0:
+        return None, None, None
+    max_idx = int(np.argmax(hist))
+    poc = (edges[max_idx] + edges[max_idx + 1]) / 2.0
+    total = hist.sum()
+    order = np.argsort(hist)[::-1]
+    cum, area_bins = 0.0, []
+    for idx in order:
+        cum += hist[idx]
+        area_bins.append((edges[idx], edges[idx + 1]))
+        if cum >= 0.70 * total:
+            break
+    vah = max(b[1] for b in area_bins)
+    val = min(b[0] for b in area_bins)
+    return float(poc), float(vah), float(val)
 
-    if not USE_MTF_4H:
-        return ok1h
-
-    df4h, _ = build_df_unified(symbol, "4h", 300)
-    if df4h is None or len(df4h) < 200:
-        ok4h = True
-    else:
-        ema50_4h, ema200_4h = df4h["EMA50"].iloc[-1], df4h["EMA200"].iloc[-1]
-        ok4h = not ((direction=="LONG" and ema50_4h<ema200_4h) or (direction=="SHORT" and ema50_4h>ema200_4h))
-    return ok1h and ok4h
-
-def vol_filter(df15):
-    if not USE_VOL_FILTER: return True
-    v = df15["volume"].iloc[-1]
-    med = df15["volume"].tail(20).median()
-    return v > VOL_MULT*med
-
-def aggr_vol_ok(df15):
-    v = df15["volume"].iloc[-1]
-    med = df15["volume"].tail(20).median()
-    return v >= AGGR_VOL_MULT*med
-
-def atr_vol_ok(df15):
-    """ATR/close deve essere >= soglia per evitare mercato troppo piatto."""
-    if not USE_ATR_VOL_FILTER: 
-        return True
-    atr = df15["ATR"].iloc[-1]
-    close = df15["close"].iloc[-1]
-    return (atr / max(close,1e-9)) >= ATR_VOL_MIN_PCT
-
-# ---- Filtri volumetrici (Order Flow) ----
-def cvd_filter_ok(df15, direction):
-    if not USE_CVD_FILTER: 
-        return True
-    if "DELTA" not in df15.columns or "CVD_SLOPE" not in df15.columns:
-        return True
-    last = df15.iloc[-1]
-    if direction == "LONG":
-        return (last.get("DELTA",0) > 0) and (last.get("CVD_SLOPE",0) > 0)
-    else:
-        return (last.get("DELTA",0) < 0) and (last.get("CVD_SLOPE",0) < 0)
-
-def delta_spike(df15):
-    if "DELTA" not in df15.columns:
-        return False
-    med = df15["DELTA"].abs().tail(20).median()
-    return abs(df15["DELTA"].iloc[-1]) >= DELTA_SPIKE_MULT * max(med, 1e-9)
-
-def vwap_filter_ok(df15, direction):
-    if not USE_VWAP_FILTER or "VWAP" not in df15.columns:
-        return True
-    last = df15.iloc[-1]
-    return (direction=="LONG" and last["close"] >= last["VWAP"]) or \
-           (direction=="SHORT" and last["close"] <= last["VWAP"])
-
-# ---- Momentum Thrust (fallback quando non c’è DELTA) ----
-def thrust_ok(df15, direction):
-    if not USE_THRUST or len(df15) < (THRUST_LOOKBACK_BARS+1):
-        return False
-    last = df15.iloc[-1]
-    ref  = df15.iloc[-(THRUST_LOOKBACK_BARS+1)]
-    move_pct = (last["close"] - ref["close"]) / max(ref["close"],1e-9) * 100
-    vol_spike = last["volume"] >= THRUST_VOL_MULT * df15["volume"].tail(20).median()
-    if direction == "LONG":
-        return (move_pct >= THRUST_PCT*100) and vol_spike
-    else:
-        return (move_pct <= -THRUST_PCT*100) and vol_spike
-
-def rr_ok(entry, tp, sl):
-    risk = abs(entry - sl); reward = abs(tp - entry)
-    rr = reward/max(risk,1e-9)
-    return rr >= MIN_RR, rr
-
-def confluence_score(df15, direction):
-    last = df15.iloc[-1]
-    ema_ok  = (last["EMA50"] > last["EMA200"]) if direction=="LONG" else (last["EMA50"] < last["EMA200"])
-    macd_ok = (last["MACD"] > last["MACD_SIGNAL"]) if direction=="LONG" else (last["MACD"] < last["MACD_SIGNAL"])
-    kd_ok   = (last["K"] > last["D"]) if direction=="LONG" else (last["K"] < last["D"])
-    return sum([ema_ok, macd_ok, kd_ok])
-
-def log_trade(row):
-    header = ["time_utc","symbol","direction","kind","entry","tp","sl","exit_price","result","rr"]
-    exists = os.path.exists(TRADES_CSV)
-    with open(TRADES_CSV,"a",newline="") as f:
-        w=csv.writer(f)
-        if not exists: w.writerow(header)
-        w.writerow(row)
-
-# ------------- ANALISI/SEGNALI -------------
-def analyze(symbol):
-    df, source = build_df_unified(symbol, "15m", 120)
-    if df is None:
-        send_telegram_message(f"⚠️ Errore dati {symbol} (tutte le fonti)")
+# ==========================
+# SIGNAL ENGINE
+# ==========================
+def acceptance_check(df: pd.DataFrame, vah: float, val: float, vol_window: int, vol_mult: float):
+    close = df["close"].values
+    vol = df["volume"].values
+    if len(close) < max(22, vol_window + 2):
         return None
-    closes = df["close"].tolist()
-    vols   = df["volume"].tolist()
-    last_close = closes[-1]
-    last_vol   = closes[-1]*vols[-1]
-    ema20 = calc_ema(closes[-20:], 20)
-    ema60 = calc_ema(closes[-60:], 60)
-    atr14 = df["ATR"].iloc[-1]
-    return {"price": last_close, "volume": last_vol, "ema20": ema20, "ema60": ema60,
-            "atr": atr14, "df": df, "source": source}
+    avg_vol = vol[-(vol_window+1):-1].mean()
+    last_vol = vol[-1]
+    last2_above_vah = close[-1] > vah and close[-2] > vah
+    last2_below_val = close[-1] < val and close[-2] < val
+    long_ok = last2_above_vah and (last_vol > vol_mult * avg_vol)
+    short_ok = last2_below_val and (last_vol > vol_mult * avg_vol)
+    return {"long": bool(long_ok), "short": bool(short_ok), "avg_vol": float(avg_vol), "last_vol": float(last_vol)}
 
-def open_trade(symbol, direction, entry_price, atr, kind="SAFE", rr_checked=True, extra_text=""):
-    if direction=="LONG":
-        sl = entry_price - ATR_SL_MULT*atr
-        tp = entry_price + ATR_TP_MULT*atr
-    else:
-        sl = entry_price + ATR_SL_MULT*atr
-        tp = entry_price - ATR_TP_MULT*atr
+def volatility_spike_flag(df: pd.DataFrame, mult=NEWS_SPIKE_MULT):
+    rng = (df["high"] - df["low"]).values
+    if len(rng) < 22:
+        return False
+    avg_rng = rng[-21:-1].mean()
+    last_rng = rng[-1]
+    return last_rng > mult * avg_rng
 
-    rr_ok_flag, rr_val = True, None
-    if not rr_checked:
-        rr_ok_flag, rr_val = rr_ok(entry_price, tp, sl)
-        if not rr_ok_flag:
-            send_telegram_message(f"⏭️ {symbol} {direction}: R/R {rr_val:.2f} < {MIN_RR}, skip")
-            return
+def rr_compute(entry: float, stop: float, tp: float, risk_usd: float):
+    stop_dist = abs(entry - stop)
+    if stop_dist <= 0:
+        return None, None, None
+    size = risk_usd / stop_dist
+    profit = size * abs(tp - entry)
+    rr = profit / risk_usd if risk_usd > 0 else 0
+    return size, profit, rr
 
-    active_trade[symbol] = {
-        "direction": direction, "entry": entry_price, "tp": tp, "sl": sl,
-        "opened_at": datetime.now(tzUTC), "moved_to_be": False,
-        "touched_1R": False, "partial_done": False, "kind": kind
-    }
-    notify_signal(symbol, direction, entry_price, tp, sl, kind, rr_val, extra_text)
+_last_signal = {}  # (symbol, side) -> (ts, entry)
+def should_send_signal(symbol: str, side: str, entry: float, cooldown_min=COOLDOWN_MIN, tol=0.002):
+    key = (symbol, side)
+    last = _last_signal.get(key)
+    now = now_utc()
+    if last:
+        ts, last_entry = last
+        if (now - ts) < timedelta(minutes=cooldown_min) and abs(entry - last_entry) / entry < tol:
+            return False
+    _last_signal[key] = (now, entry)
+    return True
 
-def monitor_trade(symbol, price, df15):
-    t = active_trade[symbol]
-    if not t: return
-    direction = t["direction"]; entry = t["entry"]; tp=t["tp"]; sl=t["sl"]; kind=t["kind"]
+_last_heartbeat = now_utc() - timedelta(minutes=HEARTBEAT_MIN+1)
+_last_any_signal = now_utc() - timedelta(hours=NO_SIGNAL_ALERT_HOURS+1)
 
-    risk = abs(entry-sl)
-    if not t["touched_1R"]:
-        if (direction=="LONG" and price >= entry + risk) or (direction=="SHORT" and price <= entry - risk):
-            t["touched_1R"] = True
-            send_telegram_message(f"🥇 {symbol} {direction} ({kind}): +1R raggiunto")
-            if USE_PARTIAL_1R and not t["partial_done"]:
-                t["partial_done"] = True
-                send_telegram_message(f"💰 {symbol}: chiusa PARZIALE 50% a +1R (simulato)")
+def build_levels_report(levels_map, news_flags, cmc_map):
+    lines = ["=============================", "🫀 HEARTBEAT – Livelli chiave", f"⏰ {now_utc()} UTC"]
+    for sym in SYMBOLS:
+        root = sym.replace("USDT", "")
+        lines.append(f"\n{sym} | Vol 24h (CMC): {fmt(cmc_map.get(root,0),0)}")
+        for tf in TIMEFRAMES:
+            k = (sym, tf)
+            d = levels_map.get(k)
+            if not d:
+                continue
+            bias = "BULL" if d["close"] > d["vah"] else ("BEAR" if d["close"] < d["val"] else "NEUTRAL")
+            news = " ⚠️ NEWS MODE" if news_flags.get(k, False) else ""
+            lines.append(f"[{tf}] Close {fmt(d['close'])} | POC {fmt(d['poc'])} | VAH {fmt(d['vah'])} | VAL {fmt(d['val'])} | Bias {bias}{news}")
+    lines.append("=============================")
+    return "\n".join(lines)
 
-    if USE_TRAILING_CH and t["touched_1R"]:
-        if len(df15) >= CH_PERIOD:
-            if direction=="LONG":
-                hh = df15["high"].tail(CH_PERIOD).max()
-                ch = hh - CH_ATR_MULT*df15["ATR"].iloc[-1]
-                t["sl"] = max(t["sl"], ch)
+def signal_message(symbol, tfs_ok, side, entry, stop, tp1, tp2, poc, vah, val, vol_bar, vol_avg, vol_glob, size, profit, rr, news_mode):
+    news = "\n⚠️ NEWS MODE: volatilità anomala, rischio elevato." if news_mode else ""
+    return f"""
+=============================
+🚨 SIGNAL {side} – {symbol}
+=============================
+⏰ {now_utc()} UTC
+TF confermati: {", ".join(tfs_ok)}
+Entry: {fmt(entry)}
+SL: {fmt(stop)}
+TP1: {fmt(tp1)}
+TP2: {fmt(tp2)}
+POC: {fmt(poc)} | VAH: {fmt(vah)} | VAL: {fmt(val)}
+Volume barra: {fmt(vol_bar)} (media {fmt(vol_avg)})
+Volume globale 24h: {fmt(vol_glob,0)}
+Rischio: {fmt(CAPITALE*RISK_PERCENT)}
+Size: {fmt(size,4)} {symbol.replace("USDT","")}
+Profitto pot.: {fmt(profit)}
+R:R = {fmt(rr,2)}{news}
+=============================
+""".strip()
+
+# ==========================
+# LOOP PRINCIPALE
+# ==========================
+print("🚀 BOT AVVIATO – BTC/ETH | 15m+30m | Volume Profile | Volumi dinamici | Telegram | Heartbeat")
+
+while True:
+    try:
+        results = []
+        levels_map = {}
+        news_flags = {}
+        cmc_map = {}
+
+        # Volumi globali (cache 10 min)
+        for sym in SYMBOLS:
+            root = sym.replace("USDT", "")
+            cmc_map[root] = get_global_volume(root)
+
+        # Dati per ciascun symbol/TF
+        for sym in SYMBOLS:
+            for tf in TIMEFRAMES:
+                try:
+                    df = get_ohlcv(sym, tf)
+                    poc, vah, val = build_volume_profile(df, bins=BINS_PROFILE)
+                    if any(v is None for v in [poc, vah, val]):
+                        continue
+                    last_close = float(df["close"].iloc[-1])
+
+                    # Filtri per TF
+                    vw = TF_SETTINGS[tf]["vol_window"]
+                    vm = TF_SETTINGS[tf]["vol_mult"]
+
+                    acc = acceptance_check(df, vah, val, vw, vm)
+                    news_mode = volatility_spike_flag(df, NEWS_SPIKE_MULT)
+
+                    levels_map[(sym, tf)] = {"poc": poc, "vah": vah, "val": val, "close": last_close}
+                    news_flags[(sym, tf)] = news_mode
+
+                    side = None
+                    reason = None
+                    if acc and acc["long"]:
+                        side = "BUY"; reason = f"Acceptance sopra VAH + vol>{vm}× media {vw} barre"
+                    elif acc and acc["short"]:
+                        side = "SELL"; reason = f"Acceptance sotto VAL + vol>{vm}× media {vw} barre"
+
+                    results.append({
+                        "symbol": sym, "tf": tf, "side": side, "reason": reason,
+                        "poc": poc, "vah": vah, "val": val, "close": last_close,
+                        "vol_bar": acc["last_vol"] if acc else 0.0,
+                        "vol_avg": acc["avg_vol"] if acc else 0.0,
+                        "news": news_mode
+                    })
+                except Exception as e:
+                    print(f"Errore {sym}-{tf}:", e)
+
+        # Conferma multi-TF e segnali
+        for sym in SYMBOLS:
+            sym_res = [r for r in results if r["symbol"] == sym and r["side"]]
+            if not sym_res:
+                continue
+            sides = set(r["side"] for r in sym_res)
+            if len(sides) != 1 or len(sym_res) < len(TIMEFRAMES):
+                continue  # niente conferma multi-TF
+
+            side = sides.pop()
+            r_fast = [r for r in sym_res if r["tf"] == "15m"][0]
+            r_slow = [r for r in sym_res if r["tf"] == "30m"][0]
+            entry = r_fast["close"]
+            poc = r_fast["poc"]; vah = r_fast["vah"]; val = r_fast["val"]
+
+            if side == "BUY":
+                stop = val
+                tp1 = poc
+                tp2 = vah + (vah - val)
             else:
-                ll = df15["low"].tail(CH_PERIOD).min()
-                ch = ll + CH_ATR_MULT*df15["ATR"].iloc[-1]
-                t["sl"] = min(t["sl"], ch)
+                stop = vah
+                tp1 = poc
+                tp2 = val - (vah - val)
 
-    if USE_TIMESTOP:
-        bars = int((datetime.now(tzUTC) - t["opened_at"]).total_seconds() // (15*60))
-        macd = df15["MACD"].iloc[-1]; sig = df15["MACD_SIGNAL"].iloc[-1]
-        macd_against = (direction=="LONG" and macd<sig) or (direction=="SHORT" and macd>sig)
-        if bars >= TIMESTOP_BARS and macd_against:
-            t["sl"] = entry
-            send_telegram_message(f"⏱️ {symbol} {direction} ({kind}): time-stop → SL a BE")
+            risk_usd = CAPITALE * RISK_PERCENT
+            size, profit, rr = rr_compute(entry, stop, tp2, risk_usd)
+            if size is None or rr < RR_MIN:
+                continue
+            if not should_send_signal(sym, side, entry, COOLDOWN_MIN):
+                continue
 
-    if direction=="LONG":
-        if price >= tp:
-            send_telegram_message(f"✅ TP LONG {symbol} ({kind}) a {round(tp,2)}")
-            log_trade([datetime.now(tzUTC),symbol,"LONG",kind,entry,tp,t['sl'],tp,"TP",round((tp-entry)/risk,2)])
-            active_trade[symbol]=None; return
-        if price <= t["sl"]:
-            res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
-            send_telegram_message(f"❌ {res} LONG {symbol} ({kind}) a {round(t['sl'],2)}")
-            log_trade([datetime.now(tzUTC),symbol,"LONG",kind,entry,tp,t['sl'],t['sl'],res,round((tp-entry)/risk,2)])
-            active_trade[symbol]=None; return
-    else:
-        if price <= tp:
-            send_telegram_message(f"✅ TP SHORT {symbol} ({kind}) a {round(tp,2)}")
-            log_trade([datetime.now(tzUTC),symbol,"SHORT",kind,entry,tp,t['sl'],tp,"TP",round((entry-tp)/risk,2)])
-            active_trade[symbol]=None; return
-        if price >= t["sl"]:
-            res = "BE" if abs(t["sl"]-entry)<1e-8 else "SL"
-            send_telegram_message(f"❌ {res} SHORT {symbol} ({kind}) a {round(t['sl'],2)}")
-            log_trade([datetime.now(tzUTC),symbol,"SHORT",kind,entry,tp,t['sl'],t['sl'],res,round((entry-tp)/risk,2)])
-            active_trade[symbol]=None; return
+            news_mode = (r_fast["news"] or r_slow["news"])
+            msg = signal_message(
+                symbol=sym, tfs_ok=[r_fast["tf"], r_slow["tf"]], side=side,
+                entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                poc=poc, vah=vah, val=val,
+                vol_bar=r_fast["vol_bar"], vol_avg=r_fast["vol_avg"],
+                vol_glob=cmc_map[sym.replace("USDT","")],
+                size=size, profit=profit, rr=rr, news_mode=news_mode
+            )
+            print(msg); send_telegram(msg)
+            _last_any_signal = now_utc()
 
-# ------------- CHECK SEGNALE -------------
-def squeeze_ok(df15, direction):
-    if not USE_BB_SQUEEZE: return True
-    last = df15.iloc[-1]
-    recent = df15.tail(10)
-    sq = (recent["BB_BW"] < BB_SQ_THRESHOLD).any()
-    if not sq: return False
-    if direction=="LONG":
-        return last["close"] > last["BB_UP"]
-    else:
-        return last["close"] < last["BB_LOW"]
+        # Heartbeat
+        global _last_heartbeat
+        if (now_utc() - _last_heartbeat) >= timedelta(minutes=HEARTBEAT_MIN):
+            hb = build_levels_report(levels_map, news_flags, cmc_map)
+            print(hb); send_telegram(hb)
+            _last_heartbeat = now_utc()
 
-def check_signal(symbol, an, levels):
-    global last_signal, last_signal_type
-    df = an["df"]; price = an["price"]; ema20=an["ema20"]; ema60=an["ema60"]; atr=an["atr"]
-    volume_usdt = an["volume"]; vol_thresh = VOLUME_THRESHOLDS[symbol]
+        # Failsafe: nessun segnale da troppo tempo
+        if (now_utc() - _last_any_signal) >= timedelta(hours=NO_SIGNAL_ALERT_HOURS):
+            warn = f"⚠️ Nessun segnale valido da {NO_SIGNAL_ALERT_HOURS}h – mercato probabilmente in bilanciamento. Continua a seguire heartbeat e livelli."
+            print(warn); send_telegram(warn)
+            _last_any_signal = now_utc()  # evita spam
 
-    if in_quiet_hours_now() and USE_VOL_FILTER:
-        return
+        time.sleep(30)
 
-    last = df.iloc[-1]; prev=df.iloc[-2]
-
-    def valid_break(level, current_price):
-        return abs((current_price-level)/level) > MIN_MOVE_PCT
-
-    def breakout_ok(level):
-        buf = level*(1+BUFFER_PCT); ret = level*(1+RETEST_TOL_PCT)
-        cond_a = last["close"]>buf and prev["close"]<=buf
-        cond_b = (last["low"]<=ret) and (last["close"]>buf)
-        return cond_a or cond_b
-
-    def breakdown_ok(level):
-        buf = level*(1-BUFFER_PCT); ret = level*(1-RETEST_TOL_PCT)
-        cond_a = last["close"]<buf and prev["close"]>=buf
-        cond_b = (last["high"]>=ret) and (last["close"]<buf)
-        return cond_a or cond_b
-
-    # ====== SICURO ======
-    # Long
-    for level in levels["breakout"]:
-        if price>=level and ema20>ema60 and valid_break(level,price) and breakout_ok(level):
-            if volume_usdt>vol_thresh and (last_signal[symbol]!="LONG"):
-                if USE_ATR_VOL_FILTER and not atr_vol_ok(df): 
-                    send_telegram_message(f"⏭️ {symbol} LONG: volatilità troppo bassa"); continue
-                if USE_VOL_FILTER and not vol_filter(df): 
-                    send_telegram_message(f"⏭️ {symbol} LONG: vol debole"); continue
-                if USE_BB_SQUEEZE and not squeeze_ok(df,"LONG"):
-                    send_telegram_message(f"⏭️ {symbol} LONG: no squeeze/banda"); continue
-                if not mtf_filter(symbol,"LONG"):
-                    send_telegram_message(f"⏭️ {symbol} LONG: MTF non allineato"); continue
-                if not cvd_filter_ok(df, "LONG"):
-                    send_telegram_message(f"⏭️ {symbol} LONG: CVD/DELTA non favorevole"); continue
-                if not vwap_filter_ok(df, "LONG"):
-                    send_telegram_message(f"⏭️ {symbol} LONG: Sopra VWAP richiesto"); continue
-
-                extra = ""
-                if "DELTA" in df.columns:
-                    extra = f"Δ: {round(df['DELTA'].iloc[-1],2)} | CVD slope: {round(df['CVD_SLOPE'].iloc[-1],2)}"
-                open_trade(symbol,"LONG", float(last["close"]), atr, kind="SAFE", rr_checked=False, extra_text=extra)
-                last_signal[symbol]="LONG"; last_signal_type[symbol]="SAFE"
-            elif volume_usdt<=vol_thresh:
-                send_telegram_message(f"⚠️ Breakout debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
-
-    # Short
-    for level in levels["breakdown"]:
-        if price<=level and ema20<ema60 and valid_break(level,price) and breakdown_ok(level):
-            if volume_usdt>vol_thresh and (last_signal[symbol]!="SHORT"):
-                if USE_ATR_VOL_FILTER and not atr_vol_ok(df): 
-                    send_telegram_message(f"⏭️ {symbol} SHORT: volatilità troppo bassa"); continue
-                if USE_VOL_FILTER and not vol_filter(df):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: vol debole"); continue
-                if USE_BB_SQUEEZE and not squeeze_ok(df,"SHORT"):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: no squeeze/banda"); continue
-                if not mtf_filter(symbol,"SHORT"):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: MTF non allineato"); continue
-                if not cvd_filter_ok(df, "SHORT"):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: CVD/DELTA non favorevole"); continue
-                if not vwap_filter_ok(df, "SHORT"):
-                    send_telegram_message(f"⏭️ {symbol} SHORT: Sotto VWAP richiesto"); continue
-
-                extra = ""
-                if "DELTA" in df.columns:
-                    extra = f"Δ: {round(df['DELTA'].iloc[-1],2)} | CVD slope: {round(df['CVD_SLOPE'].iloc[-1],2)}"
-                open_trade(symbol,"SHORT", float(last["close"]), atr, kind="SAFE", rr_checked=False, extra_text=extra)
-                last_signal[symbol]="SHORT"; last_signal_type[symbol]="SAFE"
-            elif volume_usdt<=vol_thresh:
-                send_telegram_message(f"⚠️ Breakdown debole {symbol} | {round(price,2)}$ | Vol {round(volume_usdt/1e6,1)}M")
-
-    # ====== AGGRESSIVO ======
-    if USE_AGGR and active_trade[symbol] is None:
-        # LONG aggressivo
-        for level in levels["breakout"]:
-            buf_aggr = level*(1+AGGR_BUFFER_PCT)
-            if (last["close"]>buf_aggr and ema20>=ema60 and valid_break(level, price)):
-                cond_of = (("DELTA" in df.columns) and delta_spike(df)) or thrust_ok(df,"LONG")
-                if aggr_vol_ok(df) and confluence_score(df,"LONG") >= AGGR_MIN_CONFLUENCE and cond_of:
-                    rr_needed = AGGR_REQUIRE_RR
-                    extra = ""
-                    if "DELTA" in df.columns and delta_spike(df):
-                        extra = f"Δ spike: {round(df['DELTA'].iloc[-1],2)}"
-                    elif thrust_ok(df,"LONG"):
-                        extra = "Momentum Thrust ✅"
-                    open_trade(symbol,"LONG", float(last["close"]), atr, kind="AGGR", rr_checked=rr_needed, extra_text=extra)
-                    last_signal[symbol]="LONG"; last_signal_type[symbol]="AGGR"
-                    break
-
-        # SHORT aggressivo
-        for level in levels["breakdown"]:
-            buf_aggr = level*(1-AGGR_BUFFER_PCT)
-            if (last["close"]<buf_aggr and ema20<=ema60 and valid_break(level, price)):
-                cond_of = (("DELTA" in df.columns) and delta_spike(df)) or thrust_ok(df,"SHORT")
-                if aggr_vol_ok(df) and confluence_score(df,"SHORT") >= AGGR_MIN_CONFLUENCE and cond_of:
-                    rr_needed = AGGR_REQUIRE_RR
-                    extra = ""
-                    if "DELTA" in df.columns and delta_spike(df):
-                        extra = f"Δ spike: {round(df['DELTA'].iloc[-1],2)}"
-                    elif thrust_ok(df,"SHORT"):
-                        extra = "Momentum Thrust ✅"
-                    open_trade(symbol,"SHORT", float(last["close"]), atr, kind="AGGR", rr_checked=rr_needed, extra_text=extra)
-                    last_signal[symbol]="SHORT"; last_signal_type[symbol]="AGGR"
-                    break
-
-    # Reset segnale se neutro
-    if levels["breakdown"][-1] < price < levels["breakout"][0]:
-        last_signal[symbol]=None
-        last_signal_type[symbol]=None
-
-# ------------- REPORT -------------
-def format_report_line(symbol, df, price, ema20, ema60, volume, source=None):
-    trend = "🟢" if ema20>ema60 else "🔴" if ema20<ema60 else "⚪"
-    base = f"{trend} {symbol}: {round(price,2)}$ | EMA20:{round(ema20,2)} | EMA60:{round(ema60,2)} | Vol:{round(volume/1e6,1)}M"
-    if "VWAP" in df.columns:
-        base += " | " + ("↑ sopra VWAP" if price>=df['VWAP'].iloc[-1] else "↓ sotto VWAP")
-    if "DELTA" in df.columns and "CVD_SLOPE" in df.columns:
-        base += f" | Δ:{round(df['DELTA'].iloc[-1],2)} | CVDΔ:{round(df['CVD_SLOPE'].iloc[-1],2)}"
-    if SEND_SOURCE_IN_REPORT and source:
-        base += f" | src:{source}"
-    return base
-
-def build_suggestion(btc_trend, eth_trend):
-    if btc_trend=="🟢" and eth_trend=="🟢": return "Suggerimento: Preferenza LONG ✅"
-    if btc_trend=="🔴" and eth_trend=="🔴": return "Suggerimento: Preferenza SHORT ❌"
-    return "Suggerimento: Trend misto – Attendere conferma ⚠️"
-
-def maybe_send_daily_report():
-    now_it = datetime.now(tzIT)
-    hh, mm = DAILY_REPORT_IT_HM
-    if now_it.strftime("%H")==hh and now_it.strftime("%M")==mm:
-        if os.path.exists(TRADES_CSV):
-            try:
-                df = pd.read_csv(TRADES_CSV)
-                today = date.today().isoformat()
-                df["time_utc"] = pd.to_datetime(df["time_utc"])
-                today_df = df[df["time_utc"].dt.date.astype(str)==today]
-                if len(today_df):
-                    wr = (today_df["result"]=="TP").mean()
-                    msg = f"📊 Daily report {today}: trades {len(today_df)}, win-rate {wr*100:.0f}%, R medio ≈ {today_df['rr'].mean():.2f}"
-                else:
-                    msg = f"📊 Daily report {today}: nessun trade."
-                send_telegram_message(msg)
-            except Exception as e:
-                print("daily report err:", e)
-
-# ------------- MAIN LOOP -------------
-if __name__ == "__main__":
-    send_startup_once()
-    while True:
-        now_it  = datetime.now(tzIT).strftime("%H:%M")
-        now_utc = datetime.now(tzUTC).strftime("%H:%M")
-        report_msg = f"🕒 Report {now_it} (Italia) | {now_utc} UTC\n"
-        trends = {}
-
-        for symbol in ["BTC","ETH"]:
-            an = analyze(symbol)
-            if an:
-                price, vol, ema20, ema60, df, src = an["price"], an["volume"], an["ema20"], an["ema60"], an["df"], an.get("source")
-                check_signal(symbol, an, LEVELS[symbol])
-                monitor_trade(symbol, price, df)
-                trends[symbol] = "🟢" if ema20>ema60 else "🔴" if ema20<ema60 else "⚪"
-                report_msg += f"\n{format_report_line(symbol, df, price, ema20, ema60, vol, src)}"
-            else:
-                report_msg += f"\n{symbol}: Errore dati"; trends[symbol]="⚪"
-
-        report_msg += f"\n\n{build_suggestion(trends['BTC'], trends['ETH'])}"
-        send_telegram_message(report_msg)
-
-        maybe_send_daily_report()
-        time.sleep(1800)  # ogni 30 minuti
+    except Exception as e:
+        print("Errore loop principale:", e)
+        time.sleep(5)

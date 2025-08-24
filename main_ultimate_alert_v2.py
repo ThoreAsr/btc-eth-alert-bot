@@ -4,6 +4,12 @@ import numpy as np
 import time
 from datetime import datetime, timedelta
 
+# ZoneInfo con fallback per ambienti <3.9
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    from backports.zoneinfo import ZoneInfo  # fallback per <3.9
+
 # ==========================
 # CONFIG
 # ==========================
@@ -33,6 +39,9 @@ CMC_REFRESH_SEC = 600                # cache CMC 10 minuti
 BOT_TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
 CHAT_ID = "356760541"
 
+# Timezone IT
+TZ = ZoneInfo("Europe/Rome")
+
 # ==========================
 # UTILS
 # ==========================
@@ -42,8 +51,11 @@ def fmt(x, nd=2):
     except Exception:
         return str(x)
 
-def now_utc():
-    return datetime.utcnow()
+def now_local():
+    return datetime.now(TZ)
+
+def ts_label():
+    return f"{now_local().strftime('%Y-%m-%d %H:%M:%S')} CET/CEST"
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -63,16 +75,17 @@ def get_ohlcv(symbol="BTCUSDT", interval="15m", limit=300):
     df = pd.DataFrame(data, columns=[
         "time","open","high","low","close","volume","c1","c2","c3","c4","c5","c6"
     ])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    # timestamps locali IT
+    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(TZ)
     for col in ["open","high","low","close","volume"]:
         df[col] = df[col].astype(float)
     return df[["time","open","high","low","close","volume"]]
 
-_cmc_cache = {}  # { "BTC": (volume, ts) }
+_cmc_cache = {}  # { "BTC": (volume, ts_epoch) }
 def get_global_volume(symbol_root="BTC"):
-    now = time.time()
+    now_epoch = time.time()
     vol, ts = _cmc_cache.get(symbol_root, (None, 0))
-    if vol is not None and (now - ts) < CMC_REFRESH_SEC:
+    if vol is not None and (now_epoch - ts) < CMC_REFRESH_SEC:
         return vol
     try:
         url = f"https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol={symbol_root}"
@@ -81,7 +94,7 @@ def get_global_volume(symbol_root="BTC"):
         r.raise_for_status()
         j = r.json()
         vol = j["data"][symbol_root]["quote"]["USD"]["volume_24h"]
-        _cmc_cache[symbol_root] = (vol, now)
+        _cmc_cache[symbol_root] = (vol, now_epoch)
         return vol
     except Exception as e:
         print("Errore CMC:", e)
@@ -144,11 +157,10 @@ def rr_compute(entry: float, stop: float, tp: float, risk_usd: float):
     return size, profit, rr
 
 _last_signal = {}  # (symbol, side) -> (ts, entry)
-
 def should_send_signal(symbol: str, side: str, entry: float, cooldown_min=COOLDOWN_MIN, tol=0.002):
     key = (symbol, side)
     last = _last_signal.get(key)
-    now = now_utc()
+    now = now_local()
     if last:
         ts, last_entry = last
         if (now - ts) < timedelta(minutes=cooldown_min) and abs(entry - last_entry) / entry < tol:
@@ -157,11 +169,11 @@ def should_send_signal(symbol: str, side: str, entry: float, cooldown_min=COOLDO
     return True
 
 # Stato heartbeat e segnali
-_last_heartbeat   = now_utc() - timedelta(minutes=HEARTBEAT_MIN+1)
-_last_any_signal  = now_utc() - timedelta(hours=NO_SIGNAL_ALERT_HOURS+1)
+_last_heartbeat   = now_local() - timedelta(minutes=HEARTBEAT_MIN+1)
+_last_any_signal  = now_local() - timedelta(hours=NO_SIGNAL_ALERT_HOURS+1)
 
 def build_levels_report(levels_map, news_flags, cmc_map):
-    lines = ["=============================", "🫀 HEARTBEAT – Livelli chiave", f"⏰ {now_utc()} UTC"]
+    lines = ["=============================", "🫀 HEARTBEAT – Livelli chiave", f"⏰ {ts_label()}"]
     for sym in SYMBOLS:
         root = sym.replace("USDT", "")
         lines.append(f"\n{sym} | Vol 24h (CMC): {fmt(cmc_map.get(root,0),0)}")
@@ -182,7 +194,7 @@ def signal_message(symbol, tfs_ok, side, entry, stop, tp1, tp2, poc, vah, val, v
 =============================
 🚨 SIGNAL {side} – {symbol}
 =============================
-⏰ {now_utc()} UTC
+⏰ {ts_label()}
 TF confermati: {", ".join(tfs_ok)}
 Entry: {fmt(entry)}
 SL: {fmt(stop)}
@@ -201,7 +213,7 @@ R:R = {fmt(rr,2)}{news}
 # ==========================
 # LOOP PRINCIPALE
 # ==========================
-print("🚀 BOT AVVIATO – BTC/ETH | 15m+30m | Volume Profile | Volumi dinamici | Telegram | Heartbeat")
+print("🚀 BOT AVVIATO – BTC/ETH | 15m+30m | Volume Profile | Volumi dinamici | Telegram | Heartbeat (ora IT)")
 
 while True:
     try:
@@ -225,7 +237,6 @@ while True:
                         continue
                     last_close = float(df["close"].iloc[-1])
 
-                    # Filtri per TF
                     vw = TF_SETTINGS[tf]["vol_window"]
                     vm = TF_SETTINGS[tf]["vol_mult"]
 
@@ -292,19 +303,19 @@ while True:
                 size=size, profit=profit, rr=rr, news_mode=news_mode
             )
             print(msg); send_telegram(msg)
-            _last_any_signal = now_utc()
+            _last_any_signal = now_local()
 
         # Heartbeat
-        if (now_utc() - _last_heartbeat) >= timedelta(minutes=HEARTBEAT_MIN):
+        if (now_local() - _last_heartbeat) >= timedelta(minutes=HEARTBEAT_MIN):
             hb = build_levels_report(levels_map, news_flags, cmc_map)
             print(hb); send_telegram(hb)
-            _last_heartbeat = now_utc()
+            _last_heartbeat = now_local()
 
         # Failsafe
-        if (now_utc() - _last_any_signal) >= timedelta(hours=NO_SIGNAL_ALERT_HOURS):
+        if (now_local() - _last_any_signal) >= timedelta(hours=NO_SIGNAL_ALERT_HOURS):
             warn = f"⚠️ Nessun segnale valido da {NO_SIGNAL_ALERT_HOURS}h – mercato probabilmente in bilanciamento."
             print(warn); send_telegram(warn)
-            _last_any_signal = now_utc()
+            _last_any_signal = now_local()
 
         time.sleep(30)
 

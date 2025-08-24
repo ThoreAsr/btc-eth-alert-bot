@@ -19,7 +19,13 @@ import matplotlib.pyplot as plt
 # CONFIG
 # ==========================
 CAPITALE = 2000
-RISK_PERCENT = 0.01                   # 1% per trade
+
+# Rischio & qualità
+RISK_PERCENT_ACCEPTANCE = 0.01   # 1% per segnali "sicuri"
+RISK_PERCENT_SPIKE      = 0.005  # 0.5% per spike
+RR_MIN_ACCEPTANCE       = 1.5
+RR_MIN_SPIKE            = 1.2
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 TIMEFRAMES = ["15m", "30m"]
 
@@ -29,24 +35,25 @@ TF_SETTINGS = {
     "30m": {"vol_window": 20, "vol_mult": 1.20},
 }
 
-# Parametri Market/Volume Profile
-BINS_PROFILE = 60                     # risoluzione profilo volume (POC/VAH/VAL)
+# Volume Profile
+BINS_PROFILE = 60
 
-# Qualità segnale / gestione
-RR_MIN = 1.5                          # niente segnali con RR < 1.5
-COOLDOWN_MIN = 15                     # deduplica stesso segnale entro X minuti
-HEARTBEAT_MIN = 30                    # report livelli ogni 30 minuti
-NEWS_SPIKE_MULT = 2.5                 # range barra > 2.5x media => NEWS MODE
-NO_SIGNAL_ALERT_HOURS = 36            # failsafe: alert se zero segnali per 36h
+# Gestione segnale
+COOLDOWN_MIN = 15
+HEARTBEAT_MIN = 30
+NEWS_SPIKE_MULT = 2.5
 
-# Modalità "⚡ Spike" (evento improvviso)
-SPIKE_RANGE_PCT = 0.02                # 2% minimo
-SPIKE_VOL_MULT  = 2.0                 # volume >= 2x media finestra TF
-SPIKE_MIN_RR    = 1.2                 # RR minimo accettato per spike (più elastico)
+# Failsafe / promemoria
+NO_SIGNAL_ALERT_HOURS    = 36
+NO_SIGNAL_REMINDER_HOURS = 6
+
+# Modalità ⚡Spike
+SPIKE_RANGE_PCT = 0.02    # 2% min
+SPIKE_VOL_MULT  = 2.0     # vol >= 2x media
 
 # CoinMarketCap (volumi globali)
 CMC_API_KEY = "e1bf46bf-1e42-4c30-8847-c011f772dcc8"
-CMC_REFRESH_SEC = 600                 # cache CMC 10 minuti
+CMC_REFRESH_SEC = 600
 
 # Telegram
 BOT_TOKEN = "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA"
@@ -87,17 +94,20 @@ def send_telegram_photo(caption: str, image_bytes: bytes):
         print("Errore invio Telegram (photo):", e)
 
 # ==========================
-# DATA
+# DATA (MEXC)
 # ==========================
 def get_ohlcv(symbol="BTCUSDT", interval="15m", limit=300):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    """
+    OHLCV da MEXC (compatibile con Binance kline).
+    https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=300
+    """
+    url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
     df = pd.DataFrame(data, columns=[
         "time","open","high","low","close","volume","c1","c2","c3","c4","c5","c6"
     ])
-    # timestamps locali IT
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(TZ)
     for col in ["open","high","low","close","volume"]:
         df[col] = df[col].astype(float)
@@ -183,11 +193,10 @@ def acceptance_check(df: pd.DataFrame, vah: float, val: float, vol_window: int, 
     return {"long": bool(long_ok), "short": bool(short_ok), "avg_vol": float(avg_vol), "last_vol": float(last_vol)}
 
 def spike_check(df: pd.DataFrame, vah: float, val: float, vol_window: int):
-    """Detecta spike improvvisi: range% >= soglia e volume >= 2x media."""
     close = df["close"].values
-    high = df["high"].values
-    low  = df["low"].values
-    vol  = df["volume"].values
+    high  = df["high"].values
+    low   = df["low"].values
+    vol   = df["volume"].values
     if len(close) < vol_window + 2:
         return None
     prev_close = close[-2]
@@ -197,14 +206,11 @@ def spike_check(df: pd.DataFrame, vah: float, val: float, vol_window: int):
     rng_pct = abs(last_high - last_low) / prev_close
     avg_vol = vol[-(vol_window+1):-1].mean()
     last_vol = vol[-1]
-
     if rng_pct >= SPIKE_RANGE_PCT and last_vol >= SPIKE_VOL_MULT * avg_vol:
-        # Direzione: breakout sopra VAH o breakdown sotto VAL o verso close-prev_close
         if last_close > vah:
             return {"side": "BUY", "rng_pct": float(rng_pct), "avg_vol": float(avg_vol), "last_vol": float(last_vol)}
         if last_close < val:
             return {"side": "SELL", "rng_pct": float(rng_pct), "avg_vol": float(avg_vol), "last_vol": float(last_vol)}
-        # fallback direzione su momentum
         if last_close > prev_close:
             return {"side": "BUY", "rng_pct": float(rng_pct), "avg_vol": float(avg_vol), "last_vol": float(last_vol)}
         else:
@@ -241,8 +247,9 @@ def should_send_signal(symbol: str, side: str, kind: str, entry: float, cooldown
     return True
 
 # Stato heartbeat e segnali
-_last_heartbeat   = now_local() - timedelta(minutes=HEARTBEAT_MIN+1)
-_last_any_signal  = now_local() - timedelta(hours=NO_SIGNAL_ALERT_HOURS+1)
+_last_heartbeat         = now_local() - timedelta(minutes=HEARTBEAT_MIN+1)
+_last_any_signal        = now_local() - timedelta(hours=NO_SIGNAL_ALERT_HOURS+1)
+_last_no_signal_notice  = now_local() - timedelta(hours=NO_SIGNAL_REMINDER_HOURS+1)
 
 def build_levels_report(levels_map, news_flags, cmc_map):
     lines = ["=============================", "🫀 HEARTBEAT – Livelli chiave", f"⏰ {ts_label()}"]
@@ -263,6 +270,7 @@ def build_levels_report(levels_map, news_flags, cmc_map):
 def signal_caption(symbol, tfs_ok, side, kind, entry, stop, tp1, tp2, poc, vah, val, vol_bar, vol_avg, vol_glob, size, profit, rr, extra_note=""):
     tag = "✅ ACCEPTANCE" if kind == "ACCEPTANCE" else "⚡ SPIKE"
     note = f"\n{extra_note}" if extra_note else ""
+    risk_pct = RISK_PERCENT_ACCEPTANCE if kind == "ACCEPTANCE" else RISK_PERCENT_SPIKE
     return f"""
 {tag} – {symbol}
 ⏰ {ts_label()}
@@ -272,14 +280,14 @@ Entry: {fmt(entry)} | SL: {fmt(stop)}
 TP1: {fmt(tp1)} | TP2: {fmt(tp2)}
 POC: {fmt(poc)} | VAH: {fmt(vah)} | VAL: {fmt(val)}
 Vol barra: {fmt(vol_bar)} (media {fmt(vol_avg)}) | Vol24h: {fmt(vol_glob,0)}
-Rischio: {fmt(CAPITALE*RISK_PERCENT)} | Size: {fmt(size,4)} {symbol.replace("USDT","")}
+Rischio: {fmt(risk_pct*CAPITALE)} | Size: {fmt(size,4)} {symbol.replace("USDT","")}
 Potenziale: {fmt(profit)} | R:R = {fmt(rr,2)}{note}
 """.strip()
 
 # ==========================
 # LOOP PRINCIPALE
 # ==========================
-print("🚀 BOT AVVIATO – BTC/ETH | 15m+30m | Acceptance + ⚡Spike | Volume Profile | Telegram (grafici) | Heartbeat (ora IT)")
+print("🚀 BOT AVVIATO – (MEXC) BTC/ETH | 15m+30m | ✅Acceptance + ⚡Spike | Volume Profile | Telegram (grafici) | Heartbeat (ora IT)")
 
 while True:
     try:
@@ -287,6 +295,7 @@ while True:
         levels_map = {}
         news_flags = {}
         cmc_map = {}
+        df_map = {}
 
         # Volumi globali (cache 10 min)
         for sym in SYMBOLS:
@@ -294,9 +303,6 @@ while True:
             cmc_map[root] = get_global_volume(root)
 
         # Dati per ciascun symbol/TF
-        # Salvo i DF per il grafico
-        df_map = {}
-
         for sym in SYMBOLS:
             for tf in TIMEFRAMES:
                 try:
@@ -307,12 +313,12 @@ while True:
                         continue
                     last_close = float(df["close"].iloc[-1])
 
-                    # Acceptance (multi-TF)
+                    # Acceptance
                     vw = TF_SETTINGS[tf]["vol_window"]
                     vm = TF_SETTINGS[tf]["vol_mult"]
                     acc = acceptance_check(df, vah, val, vw, vm)
 
-                    # Spike detector (per TF veloce, useremo 15m per il trigger)
+                    # Spike detector (sul TF corrente; useremo 15m per il trigger)
                     spk = spike_check(df, vah, val, vw)
 
                     news_mode = volatility_spike_flag(df, NEWS_SPIKE_MULT)
@@ -360,14 +366,13 @@ while True:
                 tp1 = poc
                 tp2 = val - (vah - val)
 
-            risk_usd = CAPITALE * RISK_PERCENT
+            risk_usd = CAPITALE * RISK_PERCENT_ACCEPTANCE
             size, profit, rr = rr_compute(entry, stop, tp2, risk_usd)
-            if size is None or rr < RR_MIN:
+            if size is None or rr < RR_MIN_ACCEPTANCE:
                 continue
             if not should_send_signal(sym, side, "ACCEPTANCE", entry, COOLDOWN_MIN):
                 continue
 
-            # Chart su TF veloce
             chart_png = make_chart_png(df_map[(sym, "15m")], sym, "15m", poc, vah, val)
             caption = signal_caption(
                 symbol=sym, tfs_ok=["15m","30m"], side=side, kind="ACCEPTANCE",
@@ -379,29 +384,35 @@ while True:
             send_telegram_photo(caption, chart_png)
             print(caption)
             _last_any_signal = now_local()
+            _last_no_signal_notice = now_local()
 
-        # ===== 2) Segnali ⚡ SPIKE (solo TF 15m) =====
+        # ===== 2) Segnali ⚡ SPIKE (solo TF 15m, e solo se non appena uscito un Acceptance) =====
         for sym in SYMBOLS:
+            # priorità: se è appena partito un acceptance per questo symbol negli ultimi COOLDOWN_MIN min, salta lo spike
+            recent_acc = any(k[0] == sym and k[2] == "ACCEPTANCE" and (now_local() - _last_signal[k][0]) < timedelta(minutes=COOLDOWN_MIN) for k in _last_signal)
+            if recent_acc:
+                continue
+
             r15 = next((r for r in results if r["symbol"] == sym and r["tf"] == "15m"), None)
             if not r15 or not r15["spike"]:
                 continue
+
             spike = r15["spike"]
             side = spike["side"]
             entry = r15["close"]; poc = r15["poc"]; vah = r15["vah"]; val = r15["val"]
 
-            # SL/TP aggressivi: SL sul bordo opposto della value area, TP2 = proiezione range
             if side == "BUY":
                 stop = val
                 tp1 = poc
-                tp2 = max(vah + (vah - val), entry + (entry - stop))  # almeno 1x range
+                tp2 = max(vah + (vah - val), entry + (entry - stop))
             else:
                 stop = vah
                 tp1 = poc
                 tp2 = min(val - (vah - val), entry - (stop - entry))
 
-            risk_usd = CAPITALE * RISK_PERCENT
+            risk_usd = CAPITALE * RISK_PERCENT_SPIKE
             size, profit, rr = rr_compute(entry, stop, tp2, risk_usd)
-            if size is None or rr < SPIKE_MIN_RR:
+            if size is None or rr < RR_MIN_SPIKE:
                 continue
             if not should_send_signal(sym, side, "SPIKE", entry, COOLDOWN_MIN):
                 continue
@@ -418,6 +429,7 @@ while True:
             send_telegram_photo(caption, chart_png)
             print(caption)
             _last_any_signal = now_local()
+            _last_no_signal_notice = now_local()
 
         # Heartbeat
         if (now_local() - _last_heartbeat) >= timedelta(minutes=HEARTBEAT_MIN):
@@ -425,11 +437,15 @@ while True:
             send_telegram_text(hb); print(hb)
             _last_heartbeat = now_local()
 
-        # Failsafe
-        if (now_local() - _last_any_signal) >= timedelta(hours=NO_SIGNAL_ALERT_HOURS):
-            warn = f"⚠️ Nessun segnale valido da {NO_SIGNAL_ALERT_HOURS}h – mercato probabilmente in bilanciamento."
-            send_telegram_text(warn); print(warn)
-            _last_any_signal = now_local()
+        # Failsafe / Promemoria
+        elapsed = now_local() - _last_any_signal
+        if elapsed >= timedelta(hours=NO_SIGNAL_ALERT_HOURS):
+            if (now_local() - _last_no_signal_notice) >= timedelta(hours=NO_SIGNAL_REMINDER_HOURS):
+                warn = (f"⚠️ Nessun segnale valido da {int(elapsed.total_seconds()//3600)}h – "
+                        f"mercato probabilmente in bilanciamento. "
+                        f"Promemoria ogni {NO_SIGNAL_REMINDER_HOURS}h finché non arriva un segnale.")
+                send_telegram_text(warn); print(warn)
+                _last_no_signal_notice = now_local()
 
         time.sleep(30)
 

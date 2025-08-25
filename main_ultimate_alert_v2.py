@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-BOT FAMIGLIA — Apple Watch friendly + Volumetrica + Grafico
+BOT FAMIGLIA — Apple Watch friendly + Volumetrica + Grafico + Piano Operativo
 - Prezzo/candele: MEXC primaria, Binance fallback (mirror + vision)
 - Volumi 24h: CoinMarketCap (CMC)
 - Volumetrica 15m: ultimo volume vs media 20 (↑ forte / ↑ / ≈ / ↓)
 - Trend: EMA(15) vs EMA(50) su 15m e 30m
 - Livelli: max/min ultime 48 candele 15m (~12h)
-- Alert testo: SOLO su breakout/breakdown reali (heartbeat compatto opzionale)
+- Alert: SOLO su breakout/breakdown reali (heartbeat compatto opzionale)
 - Grafico: auto su breakout/breakdown e/o spike “↑ forte”, con cooldown
+- Piano operativo nell’alert: LONG/SHORT con ingresso, STOP, TP1, TP2 e LEVA
 
 ENV obbligatorie (Render → Environment):
   TELEGRAM_BOT_TOKEN = <token>
@@ -19,13 +20,16 @@ ENV obbligatorie (Render → Environment):
 ENV opzionali:
   SYMBOLS            = BTCUSDT,ETHUSDT
   LOOP_SECONDS       = 60
-  SEND_HEARTBEAT     = false           (true per mini-battito periodico)
+  SEND_HEARTBEAT     = false
   INTERVAL_MINUTES   = 15
-  CHART_ON_BREAKOUT  = true            (grafico su breakout/breakdown)
-  CHART_ON_SPIKE     = true            (grafico se Vol15m = "↑ forte")
-  CHART_COOLDOWN_MIN = 30              (minuti minimi tra 2 grafici di stesso simbolo)
+  CHART_ON_BREAKOUT  = true
+  CHART_ON_SPIKE     = true
+  CHART_COOLDOWN_MIN = 30
+  DEFAULT_LEVERAGE   = 3               # leva suggerita negli alert
+  CAPITAL_USD        = 0               # se >0 e RISK_PER_TRADE_PCT>0, mostra sizing
+  RISK_PER_TRADE_PCT = 0               # es. 1 = rischia 1% per trade (facoltativo)
 
-Start Command (Render):
+Start Command:
   python main_ultimate_alert_v2.py
 """
 
@@ -53,6 +57,10 @@ INTERVAL_MIN    = int(os.environ.get("INTERVAL_MINUTES", "15"))
 CHART_ON_BREAKOUT   = env_bool("CHART_ON_BREAKOUT", True)
 CHART_ON_SPIKE      = env_bool("CHART_ON_SPIKE", True)
 CHART_COOLDOWN_MIN  = int(os.environ.get("CHART_COOLDOWN_MIN", "30"))
+
+DEFAULT_LEVERAGE    = float(os.environ.get("DEFAULT_LEVERAGE", "3"))
+CAPITAL_USD         = float(os.environ.get("CAPITAL_USD", "0"))
+RISK_PER_TRADE_PCT  = float(os.environ.get("RISK_PER_TRADE_PCT", "0"))
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("Imposta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nelle Environment Variables.")
@@ -176,19 +184,79 @@ def fmt_billions(x: float) -> str:
     except Exception:
         return "n/d"
 
+# ---------- OPERATIVE PLAN ----------
+def op_plan_long(res: float, sup: float) -> Tuple[float, float, float, float]:
+    """
+    Ritorna (entry, stop, tp1, tp2)
+    - entry: rottura resistenza (res)
+    - stop: poco sotto il supporto (buffer 0.2%)
+    - TP1/TP2: 1R e 2R dove R = entry - stop
+    """
+    entry = res
+    stop  = sup * 0.998  # buffer 0.2% sotto il supporto
+    R = max(entry - stop, 1e-6)
+    tp1 = entry + R
+    tp2 = entry + 2 * R
+    return entry, stop, tp1, tp2
+
+def op_plan_short(res: float, sup: float) -> Tuple[float, float, float, float]:
+    """
+    Ritorna (entry, stop, tp1, tp2)
+    - entry: rottura supporto (sup)
+    - stop: poco sopra la resistenza (buffer 0.2%)
+    - TP1/TP2: 1R e 2R dove R = stop - entry
+    """
+    entry = sup
+    stop  = res * 1.002  # buffer 0.2% sopra la resistenza
+    R = max(stop - entry, 1e-6)
+    tp1 = entry - R
+    tp2 = entry - 2 * R
+    return entry, stop, tp1, tp2
+
+def sizing_line(entry: float, stop: float) -> str:
+    """
+    Se CAPITAL_USD e RISK_PER_TRADE_PCT sono valorizzati,
+    mostra rischio stimato e size teorica (in USD non leva).
+    """
+    if CAPITAL_USD > 0 and RISK_PER_TRADE_PCT > 0:
+        risk_usd = CAPITAL_USD * (RISK_PER_TRADE_PCT / 100.0)
+        per_unit_risk = abs(entry - stop)
+        if per_unit_risk <= 0:
+            return ""
+        qty = risk_usd / per_unit_risk  # quantità base-asset per rischiare quella cifra (senza leva)
+        return f"💼 Rischio {RISK_PER_TRADE_PCT:.1f}% (~${risk_usd:.0f}) | Size≈ {qty:.4f}"
+    return ""
+
+# ---------- MESSAGES ----------
 def build_alert(symbol: str, price: float, tr15: str, tr30: str,
                 res: float, sup: float,
                 vol_spike_pct: float, vol_spike_label: str,
                 vol24h_usd: Optional[float]) -> str:
     v24 = fmt_billions(vol24h_usd) if vol24h_usd is not None else "n/d"
-    return (
+
+    eL, sL, t1L, t2L = op_plan_long(res, sup)
+    eS, sS, t1S, t2S = op_plan_short(res, sup)
+
+    size_note_long  = sizing_line(eL, sL)
+    size_note_short = sizing_line(eS, sS)
+
+    # Stringhe compatte (Apple Watch)
+    msg = (
         f"📉 {symbol}\n"
         f"💵 {fmt_price(price)}\n"
         f"📈 15m:{tr15} | 30m:{tr30}\n"
         f"🔑 R:{round_k(res)} | S:{round_k(sup)}\n"
         f"🔊 Vol15m: {vol_spike_label} ({vol_spike_pct:.0f}%) | 24h:{v24}\n"
-        f"👉 Long >{round_k(res)} | Short <{round_k(sup)}"
+        f"🟩 LONG >{round_k(eL)} | SL {fmt_price(sL)} | 🎯 {fmt_price(t1L)} / {fmt_price(t2L)} | ⚡x{int(DEFAULT_LEVERAGE)}"
     )
+    if size_note_long:
+        msg += f"\n{size_note_long}"
+    msg += (
+        f"\n🟥 SHORT <{round_k(eS)} | SL {fmt_price(sS)} | 🎯 {fmt_price(t1S)} / {fmt_price(t2S)} | ⚡x{int(DEFAULT_LEVERAGE)}"
+    )
+    if size_note_short:
+        msg += f"\n{size_note_short}"
+    return msg
 
 def build_heartbeat(symbol: str, price: float, tr15: str, tr30: str,
                     res: float, sup: float, vol_spike_label: str) -> str:
@@ -313,7 +381,6 @@ def process_symbol(symbol: str, cmc_vols: Dict[str, float]):
                 send_photo(img, caption=f"{symbol} | R:{round_k(res)} S:{round_k(sup)}")
                 STATE.last_chart_ts[symbol] = now_ts
             except Exception:
-                # Non bloccare il loop se il grafico fallisce
                 pass
 
 def main_loop():
@@ -324,14 +391,13 @@ def main_loop():
                 process_symbol(s, cmc_vols)
         except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
-            # Silenzia i 451 (blocchi legali) che vengono gestiti da fallback
-            if code != 451:
+            if code != 451:  # silenzia i 451 (blocco/IP) gestiti dai fallback
                 try:
                     send_telegram(f"⚠️ Errore dati: HTTP {code or ''}".strip())
                 except Exception:
                     pass
         except Exception:
-            # Silenzioso: niente allegati, niente JSON
+            # Silenzioso: niente allegati
             pass
         time.sleep(LOOP_SECONDS)
 

@@ -4,3 +4,4 @@ numpy
 matplotlib
 backports.zoneinfo; python_version < "3.9"
 requests==2.31.0
+matplotlib==3.9.0

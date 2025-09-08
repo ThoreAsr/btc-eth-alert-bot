@@ -3,26 +3,26 @@
 
 """
 BOT FAMIGLIA — Watch-friendly + Volumetrica + Grafico + Piano Operativo
-Anti-429 edition: cache interna, jitter e backoff.
+Anti-429 + Fix CMC headers (401) + avvio/avviso rate-limit.
 
 - Prezzo/candele: MEXC primaria, Binance fallback (mirror + vision)
-- Volumi 24h: CoinMarketCap (CMC) (cache 10 min)
+- Volumi 24h: CoinMarketCap (CMC) (cache 15 min)
 - Volumetrica 15m: ultimo volume vs media 20 (↑ forte / ↑ / ≈ / ↓)
 - Trend: EMA(15) vs EMA(50) su 15m e 30m
 - Livelli: max/min ultime 48 candele 15m (~12h)
-- Alert: SOLO su breakout/breakdown reali (heartbeat compatto opzionale)
+- Alert: SOLO su breakout/breakdown reali (heartbeat opzionale)
 - Grafico: auto su breakout/breakdown e/o spike “↑ forte”, con cooldown
 - Piano operativo: LONG/SHORT con ingresso, STOP, TP1, TP2, LEVA
-- Anti-rate limit: cache per klines 15m/30m, CMC; jitter random e backoff su 429
+- Anti-rate limit: cache interna, jitter, backoff, avviso 429/451 max 1x/10min
 
 ENV obbligatorie:
   TELEGRAM_BOT_TOKEN
-  TELEGRAM_CHAT_ID      (-100..., oppure più ID separati da virgola)
+  TELEGRAM_CHAT_ID      (-100..., o più ID separati da virgola)
   CMC_API_KEY           (se assente i 24h saranno "n/d")
 
-ENV consigliate:
-  LOOP_SECONDS=180
+ENV utili:
   SYMBOLS=BTCUSDT,ETHUSDT
+  LOOP_SECONDS=240
   SEND_HEARTBEAT=false
   INTERVAL_MINUTES=15
   CHART_ON_BREAKOUT=true
@@ -47,7 +47,7 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 CMC_API_KEY        = os.environ.get("CMC_API_KEY", "")
 
 SYMBOLS         = [s.strip().upper() for s in os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
-LOOP_SECONDS    = int(os.environ.get("LOOP_SECONDS", "180"))  # default 3m per anti-429
+LOOP_SECONDS    = int(os.environ.get("LOOP_SECONDS", "240"))  # 4m default anti-429
 SEND_HEARTBEAT  = env_bool("SEND_HEARTBEAT", False)
 INTERVAL_MIN    = int(os.environ.get("INTERVAL_MINUTES", "15"))
 
@@ -77,26 +77,26 @@ BINANCE_BASES = [
 ]
 
 # ---------- CACHE & RATE LIMIT ----------
-CACHE: Dict[str, dict] = {
-    # chiavi:
-    # f"{symbol}_15m": {"ts": epoch, "data": klines}
-    # f"{symbol}_30m": {"ts": epoch, "data": klines}
-    # "CMC_VOL": {"ts": epoch, "data": {base:vol}}
-}
-TTL_15M = 300   # s, minimo 3 minuti per candele 15m
-TTL_30M = 600   # s, minimo 6 minuti per candele 30m
-TTL_CMC = 900   # s, 15 minuti
+CACHE: Dict[str, dict] = {}
+# TTL un po' più alti per ridurre richieste
+TTL_15M = 300   # 5 min per klines 15m
+TTL_30M = 900   # 15 min per klines 30m
+TTL_CMC = 900   # 15 min per CMC
+
+LAST_RATE_WARN = {"ts": 0}  # per non spammare avvisi 429/451
 
 def jitter_sleep(min_s=0.3, max_s=0.9):
     time.sleep(random.uniform(min_s, max_s))
 
-def http_get(url: str, params: dict, timeout=15, retries=3, backoff=2.0):
+def http_get(url: str, params: dict, timeout=15, retries=3, backoff=2.0, headers=None):
+    """
+    GET con backoff su 429; supporta headers (fix CMC 401).
+    """
     last = None
     for i in range(retries):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
             if r.status_code == 429:
-                # backoff su 429
                 time.sleep((i+1) * backoff)
                 continue
             r.raise_for_status()
@@ -145,20 +145,24 @@ def fetch_cmc_volumes_cached(symbols: List[str]) -> Dict[str, float]:
         return c["data"]
     if not CMC_API_KEY:
         return {}
-    bases = sorted({s.replace("USDT", "").replace("USD", "") for s in symbols})
-    url = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
-    headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
-    jitter_sleep(0.2, 0.6)
-    r = http_get(url, {"symbol": ",".join(bases), "convert": "USD"}, timeout=12)
-    data = r.json().get("data", {})
-    out: Dict[str, float] = {}
-    for base in bases:
-        try:
-            out[base] = float(data[base][0]["quote"]["USD"]["volume_24h"])
-        except Exception:
-            pass
-    CACHE["CMC_VOL"] = {"ts": now, "data": out}
-    return out
+    try:
+        bases = sorted({s.replace("USDT", "").replace("USD", "") for s in symbols})
+        url = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
+        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
+        jitter_sleep(0.2, 0.6)
+        r = http_get(url, {"symbol": ",".join(bases), "convert": "USD"}, timeout=12, headers=headers)
+        data = r.json().get("data", {})
+        out: Dict[str, float] = {}
+        for base in bases:
+            try:
+                out[base] = float(data[base][0]["quote"]["USD"]["volume_24h"])
+            except Exception:
+                pass
+        CACHE["CMC_VOL"] = {"ts": now, "data": out}
+        return out
+    except Exception:
+        # Se CMC fallisce, usa la cache precedente (se esiste) o {}.
+        return c["data"] if c else {}
 
 # ---------- INDICATORS ----------
 def ema(values: List[float], length: int) -> List[float]:
@@ -388,6 +392,12 @@ def process_symbol(symbol: str, cmc_vols: Dict[str, float]):
                 pass
 
 def main_loop():
+    # annuncio avvio una sola volta
+    try:
+        send_telegram("🟢 Bot avviato: monitor BTC & ETH (15m/30m).")
+    except Exception:
+        pass
+
     while True:
         try:
             cmc_vols = fetch_cmc_volumes_cached(SYMBOLS)
@@ -395,14 +405,22 @@ def main_loop():
                 process_symbol(s, cmc_vols)
         except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
-            # Silenzia 429/451; logga solo altri errori
-            if code not in (429, 451):
+            # 429/451: avvisa max 1 volta ogni 10 minuti
+            if code in (429, 451):
+                now = time.time()
+                if now - LAST_RATE_WARN["ts"] > 600:
+                    try:
+                        send_telegram(f"⚠️ Rate limit {code}: rallento e riprovo…")
+                    except Exception:
+                        pass
+                    LAST_RATE_WARN["ts"] = now
+            else:
                 try:
                     send_telegram(f"⚠️ Errore dati: HTTP {code or ''}".strip())
                 except Exception:
                     pass
         except Exception:
-            # Silenzioso: niente allegati
+            # silenzioso
             pass
         time.sleep(LOOP_SECONDS)
 

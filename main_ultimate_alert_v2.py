@@ -89,6 +89,17 @@ VWAP_CONFIRMATION   = _env_bool("VWAP_CONFIRMATION", True)
 CONFLUENCE_N        = int(os.environ.get("CONFLUENCE_N", "2"))
 BANDS_STDEV_MULT    = float(os.environ.get("BANDS_STDEV_MULT", "1.0"))
 
+# --- Floors per TP (percentuali e USD) ---
+MIN_TP1_PCT_BTC = float(os.environ.get("MIN_TP1_PCT_BTC", "0.15"))
+MIN_TP2_PCT_BTC = float(os.environ.get("MIN_TP2_PCT_BTC", "0.35"))
+MIN_TP1_PCT_ETH = float(os.environ.get("MIN_TP1_PCT_ETH", "0.20"))
+MIN_TP2_PCT_ETH = float(os.environ.get("MIN_TP2_PCT_ETH", "0.45"))
+
+MIN_TP1_USD_BTC = float(os.environ.get("MIN_TP1_USD_BTC", "80"))
+MIN_TP2_USD_BTC = float(os.environ.get("MIN_TP2_USD_BTC", "180"))
+MIN_TP1_USD_ETH = float(os.environ.get("MIN_TP1_USD_ETH", "6"))
+MIN_TP2_USD_ETH = float(os.environ.get("MIN_TP2_USD_ETH", "14"))
+
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError("Imposta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nelle Environment Variables.")
 
@@ -340,21 +351,46 @@ def volume_spike_15m(vols: List[float], lookback=20)->Tuple[float,str]:
     else: label="≈"
     return pct,label
 
-def op_plan_long(res,sup,atr,price):
-    entry=res
-    if USE_ATR_PLAN and atr:
-        sl=entry-ATR_MULT_SL*atr; tp1=entry+ATR_MULT_TP1*atr; tp2=entry+ATR_MULT_TP2*atr
-    else:
-        sl=sup*0.998; R=max(entry-sl,1e-6); tp1=entry+R; tp2=entry+2*R
-    return entry,sl,tp1,tp2
+# ---- TP floors helpers + op-plan PATCH ----
+def _tp_floors(symbol: str, price: float) -> Tuple[float, float]:
+    base = _sym_base(symbol)
+    if base == "BTC":
+        f1 = max(MIN_TP1_PCT_BTC/100.0 * price, MIN_TP1_USD_BTC)
+        f2 = max(MIN_TP2_PCT_BTC/100.0 * price, MIN_TP2_USD_BTC)
+    else:  # ETH e altri
+        f1 = max(MIN_TP1_PCT_ETH/100.0 * price, MIN_TP1_USD_ETH)
+        f2 = max(MIN_TP2_PCT_ETH/100.0 * price, MIN_TP2_USD_ETH)
+    return f1, f2
 
-def op_plan_short(res,sup,atr,price):
-    entry=sup
+def op_plan_long(res, sup, atr, price, symbol=""):
+    entry = res
+    f1, f2 = _tp_floors(symbol, price)
     if USE_ATR_PLAN and atr:
-        sl=entry+ATR_MULT_SL*atr; tp1=entry-ATR_MULT_TP1*atr; tp2=entry-ATR_MULT_TP2*atr
+        sl  = entry - ATR_MULT_SL  * atr
+        tp1 = entry + max(ATR_MULT_TP1 * atr, f1)
+        tp2 = entry + max(ATR_MULT_TP2 * atr, f2)
     else:
-        sl=res*1.002; R=max(sl-entry,1e-6); tp1=entry-R; tp2=entry-2*R
-    return entry,sl,tp1,tp2
+        sl  = sup * 0.998
+        R1  = max(entry - sl, f1)
+        R2  = max(2 * (entry - sl), f2)
+        tp1 = entry + R1
+        tp2 = entry + R2
+    return entry, sl, tp1, tp2
+
+def op_plan_short(res, sup, atr, price, symbol=""):
+    entry = sup
+    f1, f2 = _tp_floors(symbol, price)
+    if USE_ATR_PLAN and atr:
+        sl  = entry + ATR_MULT_SL  * atr
+        tp1 = entry - max(ATR_MULT_TP1 * atr, f1)
+        tp2 = entry - max(ATR_MULT_TP2 * atr, f2)
+    else:
+        sl  = res * 1.002
+        R1  = max(sl - entry, f1)
+        R2  = max(2 * (sl - entry), f2)
+        tp1 = entry - R1
+        tp2 = entry - R2
+    return entry, sl, tp1, tp2
 
 def suggested_leverage(atr, price)->int:
     base=int(DEFAULT_LEVERAGE)
@@ -399,9 +435,12 @@ def process_symbol(symbol: str, cmc_vols: Dict[str,float]):
             if LOGO_URL: tg_photo(LOGO_URL, caption=hb)
             else: tg_send(hb)
 
-    # setup su cambio banda
+    # setup su cambio banda → STATO: ATTESA
     if prev_side!=now_side:
+        # trigger atteso: se siamo sopra, probabile attesa short (sup); se sotto, attesa long (res)
+        trigger_txt = fmt_price(res) if now_side!="above" else fmt_price(sup)
         txt=(f"{brand_prefix()} | 📉 {symbol}\n"
+             f"📍 STATO: ATTESA (trigger {trigger_txt})\n"
              f"💵 {fmt_price(price)}\n"
              f"📈 15m:{tr15} | 30m:{tr30}\n"
              f"🔑 R:{round_k(res)} | S:{round_k(sup)}\n"
@@ -436,8 +475,8 @@ def process_symbol(symbol: str, cmc_vols: Dict[str,float]):
     # posizione
     if symbol not in STATE.pos: STATE.pos[symbol]=Position()
     P=STATE.pos[symbol]
-    eL,sL,t1L,t2L = op_plan_long(res,sup,atr,price)
-    eS,sS,t1S,t2S = op_plan_short(res,sup,atr,price)
+    eL,sL,t1L,t2L = op_plan_long(res,sup,atr,price,symbol)
+    eS,sS,t1S,t2S = op_plan_short(res,sup,atr,price,symbol)
 
     # exits
     if P.side=="long":
@@ -486,12 +525,13 @@ def process_symbol(symbol: str, cmc_vols: Dict[str,float]):
         can_long  = can_long  and long_vwap_ok
         can_short = can_short and short_vwap_ok
 
-    # entry
+    # entry (messaggi in IT con STATO: ENTRATA)
     now_ts=time.time()
     if P.side is None:
         if can_long and now_ts-P.last_entry_ts>MIN_ENTRY_COOLDOWN:
             P.side="long"; P.entry=eL; P.sl=sL; P.tp1=t1L; P.tp2=t2L; P.hit_tp1=False; P.last_entry_ts=now_ts
             msg=(f"{brand_prefix()} | 🚨 LONG [{symbol}]\n"
+                 f"📍 STATO: ENTRATA\n"
                  f"💵 {fmt_price(price)} | trigger {fmt_price(eL)} | ⚡x{suggested_leverage(atr,price)}\n"
                  f"🛡️ SL {fmt_price(sL)}  🎯 {fmt_price(t1L)} / {fmt_price(t2L)}\n"
                  f"VWAP D:{fmt_price(vinfo['vD'])} W:{fmt_price(vinfo['vW'])} M:{fmt_price(vinfo['vM'])}  "
@@ -504,6 +544,7 @@ def process_symbol(symbol: str, cmc_vols: Dict[str,float]):
         elif can_short and now_ts-P.last_entry_ts>MIN_ENTRY_COOLDOWN:
             P.side="short"; P.entry=eS; P.sl=sS; P.tp1=t1S; P.tp2=t2S; P.hit_tp1=False; P.last_entry_ts=now_ts
             msg=(f"{brand_prefix()} | 🚨 SHORT [{symbol}]\n"
+                 f"📍 STATO: ENTRATA\n"
                  f"💵 {fmt_price(price)} | trigger {fmt_price(eS)} | ⚡x{suggested_leverage(atr,price)}\n"
                  f"🛡️ SL {fmt_price(sS)}  🎯 {fmt_price(t1S)} / {fmt_price(t2S)}\n"
                  f"VWAP D:{fmt_price(vinfo['vD'])} W:{fmt_price(vinfo['vW'])} M:{fmt_price(vinfo['vM'])}  "

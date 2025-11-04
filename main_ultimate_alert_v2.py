@@ -8,23 +8,24 @@ BOT FAMIGLIA — TOP ULTRA (uscite intelligenti)
 - Exit per esaurimento spinta (EMA/RSI)
 - Momentum trigger opzionale
 - RSI + MACD + ATR + Volumetrica + grafici con cooldown
+- Pronto per Git + Render (Background Worker)
 """
 
 import os, io, time, random
 from typing import List, Tuple, Dict, Optional
 import requests
 
-# ========= ENV =========
+# ========= ENV (con default tuoi, ma sovrascrivibili) =========
 def _env_bool(n, d): return os.getenv(n, str(d)).strip().lower() in ("1","true","yes","y","on")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
-CHAT  = os.getenv("TELEGRAM_CHAT_ID","")
-CMC_KEY = os.getenv("CMC_API_KEY","")
+TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "7743774612:AAFPCrhztElZoKqBuQ3HV8aPTfIianV8XzA")
+CHAT   = os.getenv("TELEGRAM_CHAT_ID", "-1002181919588")  # gruppo/canale famiglia
+CMC_KEY= os.getenv("CMC_API_KEY", "e1bf46bf-1e42-4c30-8847-c011f772dcc8")
 
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT").split(",") if s.strip()]
-LOOP_SECONDS = int(os.getenv("LOOP_SECONDS","240"))
-SEND_HEARTBEAT = _env_bool("SEND_HEARTBEAT", False)
-INTERVAL_MIN = int(os.getenv("INTERVAL_MINUTES","15"))
+LOOP_SECONDS  = int(os.getenv("LOOP_SECONDS","240"))
+SEND_HEARTBEAT= _env_bool("SEND_HEARTBEAT", False)
+INTERVAL_MIN  = int(os.getenv("INTERVAL_MINUTES","15"))
 
 # conferme ingresso
 RSI_CONFIRMATION   = _env_bool("RSI_CONFIRMATION", True)
@@ -45,17 +46,17 @@ ATR_MAX_LEV_PC     = float(os.getenv("ATR_MAX_LEV_PC","1.8"))
 MIN_ENTRY_COOLDOWN = int(os.getenv("MIN_ENTRY_COOLDOWN_MIN","10"))*60
 
 # trailing & gestione uscita
-PARTIAL_TP1_PCT     = float(os.getenv("PARTIAL_TP1_PCT","50"))   # % posizione "virtuale" chiusa a TP1 (messaggio)
-BE_OFFSET_ATR_MULT  = float(os.getenv("BE_OFFSET_ATR_MULT","0.2")) # BE + 0.2*ATR (long), BE - 0.2*ATR (short)
-TRAIL_ATR_MULT      = float(os.getenv("TRAIL_ATR_MULT","1.2"))     # distanza trailing = 1.2*ATR
-EXHAUST_RSI_LONG    = float(os.getenv("EXHAUST_RSI_LONG","48"))    # se RSI scende sotto -> exit long
-EXHAUST_RSI_SHORT   = float(os.getenv("EXHAUST_RSI_SHORT","52"))   # se RSI sale sopra -> exit short
-EXHAUST_EMA_FAST    = int(os.getenv("EXHAUST_EMA_FAST","9"))       # prezzo < EMA9 long → exit (e viceversa)
+PARTIAL_TP1_PCT     = float(os.getenv("PARTIAL_TP1_PCT","50"))    # % “virtuale” chiusa a TP1 (messaggio)
+BE_OFFSET_ATR_MULT  = float(os.getenv("BE_OFFSET_ATR_MULT","0.2"))# BE + 0.2*ATR (long), BE - 0.2*ATR (short)
+TRAIL_ATR_MULT      = float(os.getenv("TRAIL_ATR_MULT","1.2"))    # distanza trailing = 1.2*ATR
+EXHAUST_RSI_LONG    = float(os.getenv("EXHAUST_RSI_LONG","48"))   # se RSI scende sotto -> exit long
+EXHAUST_RSI_SHORT   = float(os.getenv("EXHAUST_RSI_SHORT","52"))  # se RSI sale sopra -> exit short
+EXHAUST_EMA_FAST    = int(os.getenv("EXHAUST_EMA_FAST","9"))      # prezzo < EMA9 long → exit (viceversa short)
 
-# momentum trigger (alert anche senza rottura livello)
+# momentum trigger
 MOMENTUM_TRIGGER      = _env_bool("MOMENTUM_TRIGGER", True)
 MOMENTUM_LOOKBACK_BARS= int(os.getenv("MOMENTUM_LOOKBACK_BARS","4"))
-MOMENTUM_PCT          = float(os.getenv("MOMENTUM_PCT","1.2"))  # % su 15m*bars
+MOMENTUM_PCT          = float(os.getenv("MOMENTUM_PCT","1.2"))    # % su 15m*bars
 
 # grafici
 CHART_ON_BREAKOUT = _env_bool("CHART_ON_BREAKOUT", True)
@@ -65,7 +66,7 @@ CHART_COOLDOWN_MIN= int(os.getenv("CHART_COOLDOWN_MIN","30"))
 DEFAULT_LEVERAGE  = float(os.getenv("DEFAULT_LEVERAGE","3"))
 
 if not TOKEN or not CHAT:
-    raise RuntimeError("Setta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nelle Environment di Render.")
+    raise RuntimeError("Setta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID (Render → Environment).")
 
 # ========= HTTP / provider =========
 MEXC_BASES = ["https://api.mexc.com","https://www.mexc.com"]
@@ -230,20 +231,18 @@ def msg_entry(sym, side, entry, sl, tp1, tp2, price, rsi_v, macd_ok, lev):
     side_n="LONG" if side=="long" else "SHORT"
     r = f" | RSI:{rsi_v:.0f}" if rsi_v is not None else ""
     m = " | MACD✓" if macd_ok else ""
-    return (f"🚨 ALERT TRADE [{sym}] {side_n}\n"
-            f"💵 {fmt_price(price)} | trigger {fmt_price(entry)}\n"
-            f"🛡️ SL {fmt_price(sl)}  🎯 {fmt_price(tp1)} / {fmt_price(tp2)}  ⚡x{lev}{r}{m}")
+    # prima riga ultra-chiara per Apple Watch
+    head = f"🚨 {sym} {side_n} {fmt_price(price)} [{fmt_price(entry)} | SL {fmt_price(sl)} | TP {fmt_price(tp1)}/{fmt_price(tp2)}] x{lev}"
+    tail = (f"\nMotivo: breakout + trend + conferme{r}{m}")
+    return head + tail
 
-def msg_exit(sym, reason, price): return f"🏁 EXIT TRADE [{sym}] — {reason} a {fmt_price(price)}"
+def msg_exit(sym, reason, price): return f"🏁 {sym} — {reason} a {fmt_price(price)}"
 def msg_setup(sym, price, tr15, tr30, res, sup, sp_lbl, sp_pct, v24, lev):
     vv = fmt_billions(v24) if v24 is not None else "n/d"
-    return (f"📉 {sym}\n💵 {fmt_price(price)}\n"
-            f"📈 15m:{tr15} | 30m:{tr30}\n"
-            f"🔑 R:{round_k(res)} | S:{round_k(sup)}\n"
-            f"🔊 Vol15m: {sp_lbl} ({sp_pct:.0f}%) | 24h:{vv}\n"
-            f"⚡ Leva suggerita: x{lev}")
+    return (f"📉 {sym} {fmt_price(price)} | 15m:{tr15} 30m:{tr30} | R:{round_k(res)} S:{round_k(sup)} "
+            f"| 🔊{sp_lbl} ({sp_pct:.0f}%) | 24h:{vv} | ⚡x{lev}")
 def msg_hb(sym, price, tr15, tr30, res, sup, sp_lbl):
-    return f"🫀 {sym}  {fmt_price(price)} | 15m:{tr15}/30m:{tr30} R:{round_k(res)} S:{round_k(sup)} 🔊{sp_lbl}"
+    return f"🫀 {sym} {fmt_price(price)} | 15m:{tr15}/30m:{tr30} | R:{round_k(res)} S:{round_k(sup)} 🔊{sp_lbl}"
 
 # ========= stato =========
 class Position:
@@ -309,7 +308,7 @@ def process_symbol(symbol, cmc_vols):
         if now_min%INTERVAL_MIN==0 and STATE.last_hb_minute!=now_min:
             STATE.last_hb_minute=now_min; tg_send(msg_hb(symbol,price,tr15,tr30,res,sup,sp_lbl))
 
-    # setup su cambio banda
+    # setup su cambio banda (con messaggio compatto)
     if prev_side!=now_side:
         tg_send(msg_setup(symbol,price,tr15,tr30,res,sup,sp_lbl,sp_pct,vol24,lev))
 
@@ -322,29 +321,21 @@ def process_symbol(symbol, cmc_vols):
     eS,sS,t1S,t2S = op_plan_short(res,sup,atr,price)
 
     # === uscite in corso ===
-    # aggiorna trailing (se in profitto e abbiamo un estremo nuovo)
     if P.side=="long":
-        # aggiorna max favorevole
         if P.extreme is None or price>P.extreme: P.extreme=price
-        # trailing ancorato all'estremo
         if atr:
             trail = P.extreme - TRAIL_ATR_MULT*atr
             P.sl = max(P.sl, trail)
-        # stop
         if price<=P.sl:
             tg_send(msg_exit(symbol,"STOP (long)", price)); STATE.pos[symbol]=Position()
-        # TP1 (parziale)
         elif not P.hit_tp1 and price>=P.tp1:
             P.hit_tp1=True
             be_off = (BE_OFFSET_ATR_MULT*atr if atr else 0.0)
             P.sl = max(P.sl, P.entry + be_off)
             tg_send(msg_exit(symbol, f"TP1 {int(PARTIAL_TP1_PCT)}% (long) — SL→BE", price))
-        # TP2
         elif price>=P.tp2:
             tg_send(msg_exit(symbol,"TP2 (long)", price)); STATE.pos[symbol]=Position()
-        # esaurimento spinta
         else:
-            # prezzo < EMA fast? / RSI cade?
             ef = ema(closes15, EXHAUST_EMA_FAST)
             ef_last = ef[-1] if ef and ef[-1] is not None else None
             if ef_last and price<ef_last and (rsi15 is not None and rsi15<EXHAUST_RSI_LONG) and price>P.entry:
